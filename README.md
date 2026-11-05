@@ -1,0 +1,21 @@
+# Snapshot
+
+Windows 10 及 Windows 11 截图原型。启动后驻留系统托盘。
+
+## 使用
+
+1. 按 `Ctrl+9`，移动鼠标预选窗口或应用暴露的界面控件。左键单击锁定预选区域，或按住左键拖出自由选区。
+2. 锁定后拖动选区内部可移动，拖动四角或四边中点可缩放。右键清除当前选区，回到自动预选。
+3. 按 `Enter` 或 `Ctrl+C` 复制图片，按 `Ctrl+S` 另存为 PNG，按 `Esc` 退出截图。双击选区也可复制。
+4. 在托盘右键菜单中选择「退出」结束程序。
+
+## 快捷键
+
+在托盘右键菜单中选择「编辑快捷键配置」，或打开 `%LOCALAPPDATA%\Snapshot\hotkey.txt`。文件只需一行，例如 `Ctrl+Shift+F10`。支持组合 Ctrl、Alt、Shift、Win，配合字母、数字或功能键 F1 到 F24（F12 为系统保留键）。保存为 UTF-8，退出再启动后生效。
+
+## 构建
+
+```powershell
+cargo build --release --locked
+.\target\release\snapshot.exe
+```
