@@ -1,6 +1,7 @@
 use windows_sys::Win32::Foundation::{POINT, RECT};
 
 pub const HANDLE_RADIUS: i32 = 4;
+const EDGE_HIT_RADIUS: i32 = 6;
 pub const HANDLES: [Handle; 8] = [
     Handle(-1, -1),
     Handle(0, -1),
@@ -67,11 +68,38 @@ pub fn hit_drag(rect: RECT, canvas: RECT, point: POINT) -> DragKind {
                 return DragKind::Resize(handle);
             }
         }
+        if contains(
+            RECT {
+                left: rect.left - EDGE_HIT_RADIUS,
+                top: rect.top - EDGE_HIT_RADIUS,
+                right: rect.right + EDGE_HIT_RADIUS,
+                bottom: rect.bottom + EDGE_HIT_RADIUS,
+            },
+            point,
+        ) {
+            let x = near_edge(point.x, rect.left, rect.right - 1);
+            let y = near_edge(point.y, rect.top, rect.bottom - 1);
+            if x != 0 || y != 0 {
+                return DragKind::Resize(Handle(x, y));
+            }
+        }
         if contains(rect, point) {
             return DragKind::Move;
         }
     }
     DragKind::Draw
+}
+
+fn near_edge(point: i32, start: i32, end: i32) -> i32 {
+    let start_distance = (point - start).abs();
+    let end_distance = (point - end).abs();
+    if start_distance <= EDGE_HIT_RADIUS && start_distance <= end_distance {
+        -1
+    } else if end_distance <= EDGE_HIT_RADIUS {
+        1
+    } else {
+        0
+    }
 }
 
 pub fn drag_rect(kind: DragKind, rect: RECT, canvas: RECT, start: POINT, point: POINT) -> RECT {
@@ -162,6 +190,29 @@ mod tests {
             assert_eq!(next.right, 150 + 10 * i32::from(handle.0 == 1));
             assert_eq!(next.bottom, 150 + 15 * i32::from(handle.1 == 1));
         }
+    }
+
+    #[test]
+    fn edge_segments_resize_away_from_handles_on_both_sides_of_the_line() {
+        let canvas = rect(0, 0, 300, 300);
+        let selection = rect(50, 50, 150, 150);
+        for (start, expected) in [
+            (POINT { x: 47, y: 75 }, (-1, 0)),
+            (POINT { x: 54, y: 75 }, (-1, 0)),
+            (POINT { x: 76, y: 48 }, (0, -1)),
+            (POINT { x: 151, y: 75 }, (1, 0)),
+            (POINT { x: 76, y: 151 }, (0, 1)),
+            (POINT { x: 45, y: 45 }, (-1, -1)),
+        ] {
+            let DragKind::Resize(Handle(x, y)) = hit_drag(selection, canvas, start) else {
+                panic!("expected resize at {},{}", start.x, start.y);
+            };
+            assert_eq!((x, y), expected);
+        }
+        assert!(matches!(
+            hit_drag(selection, canvas, POINT { x: 70, y: 70 }),
+            DragKind::Move
+        ));
     }
 
     #[test]

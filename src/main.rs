@@ -2,6 +2,7 @@
 
 mod capture;
 mod hotkey;
+mod overlay_ui;
 mod selection;
 mod selection_geometry;
 mod targets;

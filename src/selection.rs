@@ -12,12 +12,16 @@ use windows_sys::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::*,
         UI::{
-            Controls::Dialogs::{
-                CommDlgExtendedError, GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
-                OFN_PATHMUSTEXIST, OPENFILENAMEW,
+            Controls::{
+                Dialogs::{
+                    CommDlgExtendedError, GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
+                    OFN_PATHMUSTEXIST, OPENFILENAMEW,
+                },
+                WM_MOUSELEAVE,
             },
             Input::KeyboardAndMouse::{
-                GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_ESCAPE, VK_RETURN,
+                GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
+                TRACKMOUSEEVENT, VK_CONTROL, VK_ESCAPE, VK_RETURN,
             },
             WindowsAndMessaging::*,
         },
@@ -26,6 +30,7 @@ use windows_sys::{
 
 use crate::{
     capture::{Desktop, Surface},
+    overlay_ui::{monitor_info, HintPanel, Loupe},
     selection_geometry::{contains, drag_rect, hit_drag, intersect, DragKind, Handle, HANDLES},
     show_error,
     targets::{self, ElementProbe, Request, WindowTarget, ELEMENT_READY},
@@ -50,7 +55,9 @@ struct Selection {
     automatic: bool,
     drag: Option<Drag>,
     rect: RECT,
-    hint: RECT,
+    hint: HintPanel,
+    loupe: Option<Loupe>,
+    pointer_monitor: RECT,
 }
 
 struct Drag {
@@ -107,8 +114,15 @@ pub unsafe fn open(instance: HINSTANCE) -> io::Result<()> {
         bottom: height,
         ..Default::default()
     };
-    let hint = hint_rect(bounds, cursor);
     let source = desktop.surface.dc;
+    let monitor = monitor_info(cursor);
+    let work_area = monitor
+        .and_then(|info| overlay_rect(info.rcWork, bounds))
+        .unwrap_or(canvas);
+    let pointer_monitor = monitor
+        .and_then(|info| overlay_rect(info.rcMonitor, bounds))
+        .unwrap_or(canvas);
+    let hint = HintPanel::new(source, work_area)?;
     let dimmed = Surface::new(source, width, height)?;
     FillRect(dimmed.dc, &canvas, GetStockObject(BLACK_BRUSH));
     let blend = BLENDFUNCTION {
@@ -152,6 +166,8 @@ pub unsafe fn open(instance: HINSTANCE) -> io::Result<()> {
         drag: None,
         rect: RECT::default(),
         hint,
+        loupe: None,
+        pointer_monitor,
     }));
     hover(
         window,
@@ -174,28 +190,6 @@ fn overlay_rect(target: RECT, desktop: RECT) -> Option<RECT> {
         right: clipped.right - desktop.left,
         bottom: clipped.bottom - desktop.top,
     })
-}
-
-unsafe fn hint_rect(bounds: RECT, cursor: POINT) -> RECT {
-    let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-    let mut info = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    let area = if GetMonitorInfoW(monitor, &mut info) != 0 {
-        info.rcMonitor
-    } else {
-        bounds
-    };
-    let width = 570.min(area.right - area.left);
-    let left = area.left - bounds.left + (area.right - area.left - width) / 2;
-    let top = area.top - bounds.top + 16;
-    RECT {
-        left,
-        top,
-        right: left + width,
-        bottom: top + 32,
-    }
 }
 
 unsafe extern "system" fn window_proc(
@@ -228,6 +222,7 @@ unsafe extern "system" fn window_proc(
                 }
             });
             SetCapture(window);
+            update_loupe(window, mouse_point(lparam));
         }
         WM_MOUSEMOVE => {
             let point = mouse_point(lparam);
@@ -235,13 +230,24 @@ unsafe extern "system" fn window_proc(
                 hover(window, point);
             }
             update_cursor(point);
+            update_loupe(window, point);
         }
         WM_LBUTTONUP => {
             let point = mouse_point(lparam);
             update_drag(window, point, true);
             update_cursor(point);
+            update_loupe(window, point);
         }
         WM_RBUTTONUP => reset_automatic(window, mouse_point(lparam)),
+        WM_MOUSELEAVE => {
+            if SESSION.with_borrow(|session| {
+                session
+                    .as_ref()
+                    .is_some_and(|selection| selection.drag.is_none())
+            }) {
+                hide_loupe(window);
+            }
+        }
         ELEMENT_READY => refine_target(window),
         WM_SETCURSOR => {
             let mut point = POINT::default();
@@ -250,11 +256,17 @@ unsafe extern "system" fn window_proc(
                 return 1;
             }
         }
-        WM_CAPTURECHANGED => SESSION.with_borrow_mut(|session| {
-            if let Some(selection) = session {
-                selection.drag = None;
+        WM_CAPTURECHANGED => {
+            let interrupted = SESSION.with_borrow_mut(|session| {
+                session
+                    .as_mut()
+                    .and_then(|selection| selection.drag.take())
+                    .is_some()
+            });
+            if interrupted {
+                hide_loupe(window);
             }
-        }),
+        }
         WM_KEYDOWN => match wparam as u16 {
             VK_ESCAPE => {
                 DestroyWindow(window);
@@ -418,8 +430,70 @@ unsafe fn reset_automatic(window: HWND, point: POINT) {
             ReleaseCapture();
         }
         invalidate_change(window, old, new, canvas);
+        hide_loupe(window);
         hover(window, point);
         update_cursor(point);
+    }
+}
+
+unsafe fn update_loupe(window: HWND, point: POINT) {
+    let change = SESSION.with_borrow_mut(|session| {
+        let selection = session.as_mut()?;
+        let previous = selection.loupe;
+        let dragging = selection
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.started || !selection.automatic);
+        let visible = contains(selection.canvas, point)
+            && (dragging || !selection.automatic && contains(selection.rect, point));
+        if visible
+            && previous.is_some_and(|loupe| loupe.point.x == point.x && loupe.point.y == point.y)
+        {
+            return None;
+        }
+        selection.loupe = if visible {
+            if !contains(selection.pointer_monitor, point) {
+                let bounds = selection.desktop.bounds;
+                let cursor = POINT {
+                    x: point.x + bounds.left,
+                    y: point.y + bounds.top,
+                };
+                selection.pointer_monitor = monitor_info(cursor)
+                    .and_then(|info| overlay_rect(info.rcMonitor, bounds))
+                    .unwrap_or(selection.canvas);
+            }
+            Loupe::new(point, selection.pointer_monitor)
+        } else {
+            None
+        };
+        Some((previous, selection.loupe))
+    });
+    if let Some((previous, current)) = change {
+        if let Some(previous) = previous {
+            InvalidateRect(window, &previous.bounds, 0);
+        } else if current.is_some() {
+            let mut tracking = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: window,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut tracking);
+        }
+        if let Some(current) = current {
+            InvalidateRect(window, &current.bounds, 0);
+        }
+    }
+}
+
+unsafe fn hide_loupe(window: HWND) {
+    let loupe = SESSION.with_borrow_mut(|session| {
+        session
+            .as_mut()
+            .and_then(|selection| selection.loupe.take())
+    });
+    if let Some(loupe) = loupe {
+        InvalidateRect(window, &loupe.bounds, 0);
     }
 }
 
@@ -533,7 +607,6 @@ unsafe fn paint(window: HWND) {
         } else {
             IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
         }
-        let black = GetStockObject(BLACK_BRUSH);
         BitBlt(
             dc,
             area.left,
@@ -580,20 +653,11 @@ unsafe fn paint(window: HWND) {
                 }
             }
         }
-        let mut hint = selection.hint;
-        if intersect(hint, area).is_some() {
-            FillRect(dc, &hint, black);
-            SetBkMode(dc, TRANSPARENT as i32);
-            SetTextColor(dc, 0x00ff_ffff);
-            let old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
-            DrawTextW(
-                dc,
-                w!("单击锁定 / 拖动框选    右键重选    Enter 复制    Ctrl+S 保存    Esc 取消"),
-                -1,
-                &mut hint,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-            );
-            SelectObject(dc, old_font);
+        selection.hint.paint(dc, area);
+        if let Some(loupe) = selection.loupe {
+            if intersect(loupe.bounds, area).is_some() {
+                loupe.paint(dc, source, selection.canvas);
+            }
         }
         SelectClipRgn(dc, null_mut());
         BitBlt(
