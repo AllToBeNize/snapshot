@@ -109,6 +109,35 @@ impl Desktop {
             pixels,
         })
     }
+
+    pub unsafe fn composite_crop(&self, rect: RECT, render: impl FnOnce(HDC)) -> io::Result<Image> {
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        let surface = Surface::new(self.surface.dc, width, height)?;
+        if BitBlt(
+            surface.dc,
+            0,
+            0,
+            width,
+            height,
+            self.surface.dc,
+            rect.left,
+            rect.top,
+            SRCCOPY,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        SetViewportOrgEx(surface.dc, -rect.left, -rect.top, null_mut());
+        render(surface.dc);
+        GdiFlush();
+        let bounds = RECT {
+            right: width,
+            bottom: height,
+            ..Default::default()
+        };
+        Self { bounds, surface }.crop(bounds)
+    }
 }
 
 impl Surface {
@@ -164,6 +193,15 @@ pub struct Image {
 }
 
 impl Image {
+    pub unsafe fn into_surface(self) -> io::Result<(Surface, i32, i32)> {
+        let surface = Surface::new(null_mut(), self.width, self.height)?;
+        surface
+            .pixels
+            .as_ptr()
+            .copy_from_nonoverlapping(self.pixels.as_ptr(), self.pixels.len());
+        Ok((surface, self.width, self.height))
+    }
+
     pub fn copy_to_clipboard(&self, owner: HWND) -> io::Result<()> {
         let header = bitmap_header(self.width, self.height);
         let header_size = size_of::<BITMAPINFOHEADER>();

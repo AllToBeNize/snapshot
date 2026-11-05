@@ -1,11 +1,14 @@
 #![windows_subsystem = "windows"]
 
+mod annotation;
 mod capture;
 mod hotkey;
 mod overlay_ui;
+mod pinned;
 mod selection;
 mod selection_geometry;
 mod targets;
+mod toolbar;
 
 use std::{
     io,
@@ -57,6 +60,7 @@ unsafe fn run() -> Result<(), String> {
     let config = CONFIG.get_or_init(|| config);
     let instance = GetModuleHandleW(null());
     selection::register(instance).map_err(|error| error.to_string())?;
+    pinned::register(instance).map_err(|error| error.to_string())?;
     TASKBAR_CREATED.get_or_init(|| RegisterWindowMessageW(w!("TaskbarCreated")));
     let class = WNDCLASSW {
         lpfnWndProc: Some(tray_proc),

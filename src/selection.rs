@@ -11,11 +11,12 @@ use windows_sys::{
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::*,
+        System::LibraryLoader::GetModuleHandleW,
         UI::{
             Controls::{
                 Dialogs::{
-                    CommDlgExtendedError, GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
-                    OFN_PATHMUSTEXIST, OPENFILENAMEW,
+                    CommDlgExtendedError, GetSaveFileNameW, OFN_EXPLORER, OFN_NOCHANGEDIR,
+                    OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
                 },
                 WM_MOUSELEAVE,
             },
@@ -23,21 +24,26 @@ use windows_sys::{
                 GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
                 TRACKMOUSEEVENT, VK_CONTROL, VK_ESCAPE, VK_RETURN,
             },
+            Shell::{DefSubclassProc, SetWindowSubclass},
             WindowsAndMessaging::*,
         },
     },
 };
 
 use crate::{
+    annotation::{Draft, History, Mark, Tool},
     capture::{Desktop, Surface},
     overlay_ui::{monitor_info, HintPanel, Loupe},
+    pinned,
     selection_geometry::{contains, drag_rect, hit_drag, intersect, DragKind, Handle, HANDLES},
     show_error,
     targets::{self, ElementProbe, Request, WindowTarget, ELEMENT_READY},
+    toolbar::{Action, Toolbar, ACTIONS},
 };
 
 const CLASS: *const u16 = w!("Snapshot.Selection");
 const BORDER_BLUE: u32 = 0x00ff_8a26;
+const FINISH_TEXT: u32 = WM_APP + 3;
 
 thread_local! {
     static SESSION: RefCell<Option<Selection>> = const { RefCell::new(None) };
@@ -58,6 +64,9 @@ struct Selection {
     hint: HintPanel,
     loupe: Option<Loupe>,
     pointer_monitor: RECT,
+    annotations: History,
+    toolbar: Option<Toolbar>,
+    editor: Option<(HWND, RECT)>,
 }
 
 struct Drag {
@@ -168,6 +177,9 @@ pub unsafe fn open(instance: HINSTANCE) -> io::Result<()> {
         hint,
         loupe: None,
         pointer_monitor,
+        annotations: History::default(),
+        toolbar: None,
+        editor: None,
     }));
     hover(
         window,
@@ -202,6 +214,18 @@ unsafe extern "system" fn window_proc(
         WM_PAINT => paint(window),
         WM_ERASEBKGND => return 1,
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            let point = mouse_point(lparam);
+            finish_text(window, true);
+            let action = SESSION.with_borrow(|session| session.as_ref()?.toolbar?.hit(point));
+            if let Some(action) = action {
+                command(window, action);
+                return 0;
+            }
+            if begin_annotation(point) {
+                SetCapture(window);
+                hide_loupe(window);
+                return 0;
+            }
             SESSION.with_borrow_mut(|session| {
                 if let Some(selection) = session {
                     let point = mouse_point(lparam);
@@ -226,6 +250,9 @@ unsafe extern "system" fn window_proc(
         }
         WM_MOUSEMOVE => {
             let point = mouse_point(lparam);
+            if update_annotation(window, point, false) {
+                return 0;
+            }
             if !update_drag(window, point, false) {
                 hover(window, point);
             }
@@ -234,11 +261,18 @@ unsafe extern "system" fn window_proc(
         }
         WM_LBUTTONUP => {
             let point = mouse_point(lparam);
+            if update_annotation(window, point, true) {
+                return 0;
+            }
             update_drag(window, point, true);
             update_cursor(point);
             update_loupe(window, point);
         }
-        WM_RBUTTONUP => reset_automatic(window, mouse_point(lparam)),
+        WM_RBUTTONUP => {
+            finish_text(window, false);
+            reset_automatic(window, mouse_point(lparam));
+        }
+        FINISH_TEXT => finish_text(window, wparam != 0),
         WM_MOUSELEAVE => {
             if SESSION.with_borrow(|session| {
                 session
@@ -257,25 +291,34 @@ unsafe extern "system" fn window_proc(
             }
         }
         WM_CAPTURECHANGED => {
-            let interrupted = SESSION.with_borrow_mut(|session| {
-                session
-                    .as_mut()
-                    .and_then(|selection| selection.drag.take())
-                    .is_some()
+            let (interrupted, draft) = SESSION.with_borrow_mut(|session| {
+                let Some(selection) = session else {
+                    return (false, None);
+                };
+                (
+                    selection.drag.take().is_some(),
+                    selection.annotations.draft.take().map(|_| selection.rect),
+                )
             });
             if interrupted {
                 hide_loupe(window);
+            }
+            if let Some(rect) = draft {
+                InvalidateRect(window, &rect, 0);
             }
         }
         WM_KEYDOWN => match wparam as u16 {
             VK_ESCAPE => {
                 DestroyWindow(window);
             }
-            VK_RETURN => output(window, false),
-            key if GetKeyState(VK_CONTROL as i32) < 0 && key == b'C' as u16 => {
-                output(window, false)
-            }
-            key if GetKeyState(VK_CONTROL as i32) < 0 && key == b'S' as u16 => output(window, true),
+            VK_RETURN => command(window, Action::Copy),
+            key if GetKeyState(VK_CONTROL as i32) < 0 => match key as u8 {
+                digit @ b'1'..=b'6' => command(window, ACTIONS[(digit - b'1') as usize]),
+                b'C' => command(window, Action::Copy),
+                b'S' => command(window, Action::Save),
+                b'T' => command(window, Action::Pin),
+                _ => {}
+            },
             _ => {}
         },
         WM_DISPLAYCHANGE | WM_DPICHANGED | WM_CLOSE => {
@@ -294,6 +337,191 @@ fn mouse_point(lparam: LPARAM) -> POINT {
         x: i32::from(lparam as i16),
         y: i32::from((lparam >> 16) as i16),
     }
+}
+
+unsafe fn refresh_toolbar(window: HWND) {
+    let changed = SESSION.with_borrow_mut(|session| {
+        let selection = session.as_mut()?;
+        let previous = selection.toolbar.take();
+        if !selection.automatic && selection.drag.is_none() && !outline_empty(selection.rect) {
+            let bounds = selection.desktop.bounds;
+            let point = POINT {
+                x: selection.rect.left + bounds.left,
+                y: selection.rect.bottom - 1 + bounds.top,
+            };
+            let area = monitor_info(point)
+                .and_then(|info| overlay_rect(info.rcMonitor, bounds))
+                .unwrap_or(selection.canvas);
+            selection.toolbar = Toolbar::new(selection.rect, area);
+        }
+        if let (Some(old), Some(new)) = (previous, selection.toolbar) {
+            if EqualRect(&old.bounds, &new.bounds) != 0 {
+                return None;
+            }
+        }
+        Some([previous, selection.toolbar])
+    });
+    if let Some(changed) = changed {
+        for toolbar in changed.into_iter().flatten() {
+            InvalidateRect(window, &toolbar.bounds, 0);
+        }
+    }
+}
+
+unsafe fn command(window: HWND, action: Action) {
+    finish_text(window, true);
+    if matches!(action, Action::Copy | Action::Save | Action::Pin) {
+        output(window, action);
+        return;
+    }
+    let changed = SESSION.with_borrow_mut(|session| {
+        let selection = session.as_mut()?;
+        let toolbar = selection.toolbar?;
+        if selection.annotations.draft.is_some() {
+            return None;
+        }
+        match action {
+            Action::Tool(tool) => {
+                selection.annotations.tool =
+                    (selection.annotations.tool != Some(tool)).then_some(tool)
+            }
+            Action::Undo => selection.annotations.undo(),
+            Action::Redo => selection.annotations.redo(),
+            _ => unreachable!(),
+        }
+        Some((selection.rect, toolbar.bounds))
+    });
+    if let Some((rect, toolbar)) = changed {
+        InvalidateRect(window, &rect, 0);
+        InvalidateRect(window, &toolbar, 0);
+    }
+}
+
+fn begin_annotation(point: POINT) -> bool {
+    SESSION.with_borrow_mut(|session| {
+        let Some(selection) = session else {
+            return false;
+        };
+        if selection.automatic || !contains(selection.rect, point) {
+            return false;
+        }
+        let Some(tool) = selection.annotations.tool else {
+            return false;
+        };
+        selection.annotations.draft = Some(Draft::new(tool, point));
+        true
+    })
+}
+
+unsafe fn update_annotation(window: HWND, point: POINT, end: bool) -> bool {
+    let change = SESSION.with_borrow_mut(|session| {
+        let selection = session.as_mut()?;
+        let draft = selection.annotations.draft.as_mut()?;
+        let previous = draft.rect();
+        draft.update(point, selection.rect);
+        let current = draft.rect();
+        let finished = end.then(|| selection.annotations.draft.take().unwrap());
+        Some((previous, current, selection.rect, finished))
+    });
+    let Some((mut previous, mut current, clip, finished)) = change else {
+        return false;
+    };
+    InflateRect(&mut previous, 3, 3);
+    InflateRect(&mut current, 3, 3);
+    InvalidateRect(window, &previous, 0);
+    InvalidateRect(window, &current, 0);
+    if let Some(draft) = finished {
+        ReleaseCapture();
+        if draft.tool == Tool::Text {
+            open_text(window, draft.text_rect(clip));
+        } else {
+            let result = SESSION.with_borrow_mut(|session| {
+                let selection = session.as_mut().unwrap();
+                draft
+                    .finish(selection.desktop.surface.dc)
+                    .map(|mark| selection.annotations.push(mark))
+            });
+            if let Err(error) = result {
+                show_error(window, &format!("无法完成标注。\n{error}"));
+            }
+        }
+    }
+    true
+}
+
+unsafe fn open_text(window: HWND, rect: RECT) {
+    let editor = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        w!("EDIT"),
+        w!(""),
+        WS_CHILD | WS_VISIBLE | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        window,
+        null_mut(),
+        GetModuleHandleW(null()),
+        null(),
+    );
+    if editor.is_null() || SetWindowSubclass(editor, Some(text_proc), 1, window as usize) == 0 {
+        let error = io::Error::last_os_error();
+        if !editor.is_null() {
+            DestroyWindow(editor);
+        }
+        show_error(window, &format!("无法创建文本框。\n{error}"));
+        return;
+    }
+    SESSION.with_borrow_mut(|session| session.as_mut().unwrap().editor = Some((editor, rect)));
+    SendMessageW(
+        editor,
+        WM_SETFONT,
+        GetStockObject(DEFAULT_GUI_FONT) as usize,
+        1,
+    );
+    SetFocus(editor);
+}
+
+unsafe extern "system" fn text_proc(
+    editor: HWND,
+    message: u32,
+    key: WPARAM,
+    lparam: LPARAM,
+    _: usize,
+    parent: usize,
+) -> LRESULT {
+    if message == WM_KEYDOWN {
+        let escape = key == VK_ESCAPE as usize;
+        let control = GetKeyState(VK_CONTROL as i32) < 0;
+        if escape || (key == VK_RETURN as usize && control) {
+            PostMessageW(parent as HWND, FINISH_TEXT, usize::from(!escape), 0);
+            return 0;
+        }
+    }
+    DefSubclassProc(editor, message, key, lparam)
+}
+
+unsafe fn finish_text(window: HWND, save: bool) {
+    let editor = SESSION.with_borrow_mut(|session| session.as_mut()?.editor.take());
+    let Some((editor, rect)) = editor else { return };
+    if save {
+        let length = GetWindowTextLengthW(editor);
+        let mut text = vec![0; length as usize + 1];
+        let read = GetWindowTextW(editor, text.as_mut_ptr(), text.len() as i32);
+        text.truncate(read as usize);
+        if !text.is_empty() {
+            SESSION.with_borrow_mut(|session| {
+                session
+                    .as_mut()
+                    .unwrap()
+                    .annotations
+                    .push(Mark::Text(rect, text))
+            });
+        }
+    }
+    DestroyWindow(editor);
+    SetFocus(window);
+    InvalidateRect(window, &rect, 0);
 }
 
 unsafe fn update_drag(window: HWND, point: POINT, end: bool) -> bool {
@@ -324,11 +552,12 @@ unsafe fn update_drag(window: HWND, point: POINT, end: bool) -> bool {
     });
     if let Some((old, new, canvas, copy)) = dirty {
         invalidate_change(window, old, new, canvas);
+        refresh_toolbar(window);
         if end {
             ReleaseCapture();
         }
         if copy {
-            output(window, false);
+            command(window, Action::Copy);
         }
     }
     dirty.is_some()
@@ -413,11 +642,12 @@ unsafe fn reset_automatic(window: HWND, point: POINT) {
     let change = SESSION.with_borrow_mut(|session| {
         let selection = session.as_mut()?;
         let previous = selection.outline();
-        let was_dragging = selection.drag.take().is_some();
+        let was_dragging = selection.drag.take().is_some() || selection.annotations.draft.is_some();
         selection.automatic = true;
         selection.target = None;
         selection.pointer = None;
         selection.rect = RECT::default();
+        selection.annotations = History::default();
         Some((
             previous,
             selection.outline(),
@@ -430,6 +660,10 @@ unsafe fn reset_automatic(window: HWND, point: POINT) {
             ReleaseCapture();
         }
         invalidate_change(window, old, new, canvas);
+        if old.handles {
+            InvalidateRect(window, &old.rect, 0);
+        }
+        refresh_toolbar(window);
         hide_loupe(window);
         hover(window, point);
         update_cursor(point);
@@ -507,7 +741,9 @@ unsafe fn update_cursor(point: POINT) {
             .as_ref()
             .map(|drag| drag.kind)
             .unwrap_or_else(|| {
-                if selection.automatic {
+                if selection.automatic
+                    || (selection.annotations.tool.is_some() && contains(selection.rect, point))
+                {
                     DragKind::Draw
                 } else {
                     hit_drag(selection.rect, selection.canvas, point)
@@ -631,6 +867,7 @@ unsafe fn paint(window: HWND) {
                 visible.top,
                 SRCCOPY,
             );
+            selection.annotations.paint(dc, rect, true);
         }
         if !outline_empty(rect) {
             let blue = GetStockObject(DC_BRUSH);
@@ -659,6 +896,9 @@ unsafe fn paint(window: HWND) {
                 loupe.paint(dc, source, selection.canvas);
             }
         }
+        if let Some(toolbar) = selection.toolbar {
+            toolbar.paint(dc, selection.annotations.tool);
+        }
         SelectClipRgn(dc, null_mut());
         BitBlt(
             window_dc, area.left, area.top, width, height, dc, area.left, area.top, SRCCOPY,
@@ -670,22 +910,38 @@ unsafe fn paint(window: HWND) {
     }
 }
 
-unsafe fn output(window: HWND, save: bool) {
+unsafe fn output(window: HWND, action: Action) {
     let image = SESSION.with_borrow(|session| {
         let selection = session.as_ref()?;
         let rect = selection.rect;
-        if selection.drag.is_some() || rect.left == rect.right || rect.top == rect.bottom {
+        if selection.drag.is_some() || selection.annotations.draft.is_some() || outline_empty(rect)
+        {
             return None;
         }
-        Some(selection.desktop.crop(rect))
+        let image = selection
+            .desktop
+            .composite_crop(rect, |dc| selection.annotations.paint(dc, rect, false));
+        let desktop = selection.desktop.bounds;
+        let screen = RECT {
+            left: rect.left + desktop.left,
+            top: rect.top + desktop.top,
+            right: rect.right + desktop.left,
+            bottom: rect.bottom + desktop.top,
+        };
+        Some((image, screen))
     });
-    let Some(image) = image else { return };
+    let Some((image, screen)) = image else { return };
     let result = match image {
-        Ok(image) if save => save_image(window, image),
-        Ok(image) => image
-            .copy_to_clipboard(window)
-            .map(|()| true)
-            .map_err(|error| error.to_string()),
+        Ok(image) => match action {
+            Action::Save => save_image(window, image),
+            Action::Pin => pinned::open(image, screen)
+                .map(|()| true)
+                .map_err(|error| error.to_string()),
+            _ => image
+                .copy_to_clipboard(window)
+                .map(|()| true)
+                .map_err(|error| error.to_string()),
+        },
         Err(error) => Err(error.to_string()),
     };
     match result {
@@ -707,7 +963,7 @@ unsafe fn save_image(window: HWND, image: crate::capture::Image) -> Result<bool,
         lpstrFilter: w!("PNG 图片 (*.png)\0*.png\0"),
         lpstrFile: filename.as_mut_ptr(),
         nMaxFile: filename.len() as u32,
-        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        Flags: OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
         lpstrDefExt: w!("png"),
         ..Default::default()
     };
