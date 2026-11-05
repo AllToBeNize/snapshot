@@ -35,6 +35,20 @@ pub struct Surface {
 }
 
 impl Desktop {
+    pub fn visual_panel(
+        &self,
+        window: RECT,
+        point: windows_sys::Win32::Foundation::POINT,
+    ) -> Option<RECT> {
+        let width = self.bounds.right - self.bounds.left;
+        let height = self.bounds.bottom - self.bounds.top;
+        let pixels = unsafe {
+            // The frozen capture owns this DIB and its only write was flushed at capture time.
+            slice::from_raw_parts(self.surface.pixels.as_ptr(), pixel_len(width, height).ok()?)
+        };
+        crate::panel_edges::find_panel(pixels, width as usize, window, point)
+    }
+
     pub fn capture() -> io::Result<Self> {
         unsafe {
             let left = GetSystemMetrics(SM_XVIRTUALSCREEN);

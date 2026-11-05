@@ -33,7 +33,7 @@ use windows_sys::{
 use crate::{
     annotation::{Draft, History, Mark, Tool},
     capture::{Desktop, Surface},
-    overlay_ui::{monitor_info, HintPanel, Loupe},
+    overlay_ui::{monitor_info, HintMode, HintPanel, Loupe},
     pinned,
     selection_geometry::{contains, drag_rect, hit_drag, intersect, DragKind, Handle, HANDLES},
     show_error,
@@ -58,6 +58,7 @@ struct Selection {
     probe: Option<ElementProbe>,
     target: Option<usize>,
     pointer: Option<POINT>,
+    visual_probe: Option<(POINT, Option<RECT>)>,
     automatic: bool,
     drag: Option<Drag>,
     rect: RECT,
@@ -66,6 +67,7 @@ struct Selection {
     pointer_monitor: RECT,
     annotations: History,
     toolbar: Option<Toolbar>,
+    toolbar_hover: Option<Action>,
     editor: Option<(HWND, RECT)>,
 }
 
@@ -171,6 +173,7 @@ pub unsafe fn open(instance: HINSTANCE) -> io::Result<()> {
         probe: ElementProbe::start(window),
         target: None,
         pointer: None,
+        visual_probe: None,
         automatic: true,
         drag: None,
         rect: RECT::default(),
@@ -179,6 +182,7 @@ pub unsafe fn open(instance: HINSTANCE) -> io::Result<()> {
         pointer_monitor,
         annotations: History::default(),
         toolbar: None,
+        toolbar_hover: None,
         editor: None,
     }));
     hover(
@@ -216,9 +220,11 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             let point = mouse_point(lparam);
             finish_text(window, true);
-            let action = SESSION.with_borrow(|session| session.as_ref()?.toolbar?.hit(point));
-            if let Some(action) = action {
-                command(window, action);
+            let toolbar = SESSION.with_borrow(|session| session.as_ref()?.toolbar);
+            if let Some(toolbar) = toolbar.filter(|toolbar| contains(toolbar.bounds, point)) {
+                if let Some(action) = toolbar.hit(point) {
+                    command(window, action);
+                }
                 return 0;
             }
             if begin_annotation(point) {
@@ -256,6 +262,7 @@ unsafe extern "system" fn window_proc(
             if !update_drag(window, point, false) {
                 hover(window, point);
             }
+            update_toolbar_hover(window, Some(point));
             update_cursor(point);
             update_loupe(window, point);
         }
@@ -265,6 +272,7 @@ unsafe extern "system" fn window_proc(
                 return 0;
             }
             update_drag(window, point, true);
+            update_toolbar_hover(window, Some(point));
             update_cursor(point);
             update_loupe(window, point);
         }
@@ -274,6 +282,7 @@ unsafe extern "system" fn window_proc(
         }
         FINISH_TEXT => finish_text(window, wparam != 0),
         WM_MOUSELEAVE => {
+            update_toolbar_hover(window, None);
             if SESSION.with_borrow(|session| {
                 session
                     .as_ref()
@@ -346,7 +355,7 @@ unsafe fn refresh_toolbar(window: HWND) {
         if !selection.automatic && selection.drag.is_none() && !outline_empty(selection.rect) {
             let bounds = selection.desktop.bounds;
             let point = POINT {
-                x: selection.rect.left + bounds.left,
+                x: selection.rect.right - 1 + bounds.left,
                 y: selection.rect.bottom - 1 + bounds.top,
             };
             let area = monitor_info(point)
@@ -359,11 +368,59 @@ unsafe fn refresh_toolbar(window: HWND) {
                 return None;
             }
         }
+        selection.toolbar_hover = None;
         Some([previous, selection.toolbar])
     });
     if let Some(changed) = changed {
         for toolbar in changed.into_iter().flatten() {
             InvalidateRect(window, &toolbar.bounds, 0);
+        }
+    }
+}
+
+unsafe fn update_toolbar_hover(window: HWND, point: Option<POINT>) {
+    let changed = SESSION.with_borrow_mut(|session| {
+        let selection = session.as_mut()?;
+        let toolbar = selection.toolbar?;
+        let hovered = point.and_then(|point| toolbar.hit(point));
+        if hovered == selection.toolbar_hover {
+            return None;
+        }
+        let entered = selection.toolbar_hover.is_none() && hovered.is_some();
+        selection.toolbar_hover = hovered;
+        Some((toolbar.bounds, entered))
+    });
+    if let Some((bounds, entered)) = changed {
+        InvalidateRect(window, &bounds, 0);
+        if entered {
+            let mut tracking = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: window,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut tracking);
+        }
+    }
+}
+
+unsafe fn refresh_hint(window: HWND) {
+    let changed = SESSION.with_borrow_mut(|session| {
+        let selection = session.as_mut()?;
+        let mode = if selection.editor.is_some() {
+            HintMode::EditText
+        } else if selection.automatic {
+            HintMode::Automatic
+        } else if let Some(tool) = selection.annotations.tool {
+            HintMode::Annotate(tool)
+        } else {
+            HintMode::Selected
+        };
+        selection.hint.set_mode(selection.desktop.surface.dc, mode)
+    });
+    if let Some(bounds) = changed {
+        for rect in bounds {
+            InvalidateRect(window, &rect, 0);
         }
     }
 }
@@ -394,6 +451,7 @@ unsafe fn command(window: HWND, action: Action) {
     if let Some((rect, toolbar)) = changed {
         InvalidateRect(window, &rect, 0);
         InvalidateRect(window, &toolbar, 0);
+        refresh_hint(window);
     }
 }
 
@@ -480,6 +538,7 @@ unsafe fn open_text(window: HWND, rect: RECT) {
         1,
     );
     SetFocus(editor);
+    refresh_hint(window);
 }
 
 unsafe extern "system" fn text_proc(
@@ -522,6 +581,7 @@ unsafe fn finish_text(window: HWND, save: bool) {
     DestroyWindow(editor);
     SetFocus(window);
     InvalidateRect(window, &rect, 0);
+    refresh_hint(window);
 }
 
 unsafe fn update_drag(window: HWND, point: POINT, end: bool) -> bool {
@@ -553,6 +613,7 @@ unsafe fn update_drag(window: HWND, point: POINT, end: bool) -> bool {
     if let Some((old, new, canvas, copy)) = dirty {
         invalidate_change(window, old, new, canvas);
         refresh_toolbar(window);
+        refresh_hint(window);
         if end {
             ReleaseCapture();
         }
@@ -587,9 +648,13 @@ unsafe fn hover(window: HWND, point: POINT) {
             .find(|target| contains(target.rect, screen_point));
         let previous = selection.outline();
         let id = target.map(|target| target.id);
+        if id != selection.target {
+            selection.visual_probe = None;
+        }
         if id != selection.target || !contains(selection.rect, point) {
             selection.rect = target
                 .and_then(|target| overlay_rect(target.rect, desktop))
+                .map(|bounds| visual_region(selection, bounds, point).unwrap_or(bounds))
                 .unwrap_or_default();
         }
         selection.target = id;
@@ -604,6 +669,20 @@ unsafe fn hover(window: HWND, point: POINT) {
     if let Some((old, new, canvas)) = change {
         invalidate_change(window, old, new, canvas);
     }
+}
+
+fn visual_region(selection: &mut Selection, bounds: RECT, point: POINT) -> Option<RECT> {
+    if let Some((last, region)) = selection.visual_probe {
+        if region.is_some_and(|region| contains(region, point)) {
+            return region;
+        }
+        if (last.x - point.x).abs() < 24 && (last.y - point.y).abs() < 24 {
+            return None;
+        }
+    }
+    let region = selection.desktop.visual_panel(bounds, point);
+    selection.visual_probe = Some((point, region));
+    region
 }
 
 unsafe fn refine_target(window: HWND) {
@@ -624,18 +703,33 @@ unsafe fn refine_target(window: HWND) {
         }
         let same_point =
             found.request.point.x == screen_point.x && found.request.point.y == screen_point.y;
-        let rect = match found.rect {
-            Some(rect) if contains(rect, screen_point) => rect,
-            None if same_point => found.request.window.rect,
+        let (rect, weak) = match found.region {
+            Some(region) if contains(region.rect, screen_point) => (region.rect, region.weak),
+            None if same_point => (found.request.window.rect, true),
             _ => return None,
         };
         let previous = selection.outline();
-        selection.rect = overlay_rect(rect, desktop)?;
+        let bounds = overlay_rect(found.request.window.rect, desktop)?;
+        let semantic = overlay_rect(rect, desktop)?;
+        let visual = visual_region(selection, bounds, point);
+        selection.rect = visual
+            .filter(|visual| {
+                weak || (visual.left >= semantic.left
+                    && visual.top >= semantic.top
+                    && visual.right <= semantic.right
+                    && visual.bottom <= semantic.bottom
+                    && rect_area(*visual) * 5 < rect_area(semantic) * 4)
+            })
+            .unwrap_or(semantic);
         Some((previous, selection.outline(), selection.canvas))
     });
     if let Some((old, new, canvas)) = change {
         invalidate_change(window, old, new, canvas);
     }
+}
+
+fn rect_area(rect: RECT) -> i64 {
+    i64::from(rect.right - rect.left) * i64::from(rect.bottom - rect.top)
 }
 
 unsafe fn reset_automatic(window: HWND, point: POINT) {
@@ -646,6 +740,7 @@ unsafe fn reset_automatic(window: HWND, point: POINT) {
         selection.automatic = true;
         selection.target = None;
         selection.pointer = None;
+        selection.visual_probe = None;
         selection.rect = RECT::default();
         selection.annotations = History::default();
         Some((
@@ -664,6 +759,7 @@ unsafe fn reset_automatic(window: HWND, point: POINT) {
             InvalidateRect(window, &old.rect, 0);
         }
         refresh_toolbar(window);
+        refresh_hint(window);
         hide_loupe(window);
         hover(window, point);
         update_cursor(point);
@@ -736,6 +832,16 @@ unsafe fn update_cursor(point: POINT) {
         let Some(selection) = session else {
             return IDC_CROSS;
         };
+        if let Some(toolbar) = selection
+            .toolbar
+            .filter(|toolbar| contains(toolbar.bounds, point))
+        {
+            return if toolbar.hit(point).is_some() {
+                IDC_HAND
+            } else {
+                IDC_ARROW
+            };
+        }
         let kind = selection
             .drag
             .as_ref()
@@ -896,8 +1002,11 @@ unsafe fn paint(window: HWND) {
                 loupe.paint(dc, source, selection.canvas);
             }
         }
-        if let Some(toolbar) = selection.toolbar {
-            toolbar.paint(dc, selection.annotations.tool);
+        if let Some(toolbar) = selection
+            .toolbar
+            .filter(|toolbar| intersect(toolbar.bounds, area).is_some())
+        {
+            toolbar.paint(dc, selection.annotations.tool, selection.toolbar_hover);
         }
         SelectClipRgn(dc, null_mut());
         BitBlt(

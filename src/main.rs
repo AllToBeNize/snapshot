@@ -4,6 +4,7 @@ mod annotation;
 mod capture;
 mod hotkey;
 mod overlay_ui;
+mod panel_edges;
 mod pinned;
 mod selection;
 mod selection_geometry;

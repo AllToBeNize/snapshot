@@ -7,10 +7,12 @@ use windows_sys::{
     },
 };
 
-use crate::{capture::Surface, selection_geometry::intersect};
+use crate::{annotation::Tool, capture::Surface, selection_geometry::intersect};
 
-const PANEL_WIDTH: i32 = 320;
-const PANEL_HEIGHT: i32 = 138;
+const PANEL_WIDTH: i32 = 272;
+const ROW_HEIGHT: i32 = 23;
+const PANEL_INSET: i32 = 10;
+const PANEL_HEIGHT: i32 = 5 * ROW_HEIGHT + 2 * PANEL_INSET;
 const PANEL_MARGIN: i32 = 16;
 const ZOOM: i32 = 5;
 const SAMPLE_WIDTH: i32 = 33;
@@ -32,21 +34,125 @@ pub unsafe fn monitor_info(cursor: POINT) -> Option<MONITORINFO> {
 pub struct HintPanel {
     pub bounds: RECT,
     surface: Surface,
+    max_height: i32,
+    bottom: i32,
+    mode: Option<HintMode>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HintMode {
+    Automatic,
+    Selected,
+    Annotate(Tool),
+    EditText,
+}
+
+impl HintMode {
+    fn rows(self) -> &'static [(*const u16, *const u16)] {
+        match self {
+            Self::Automatic => {
+                const {
+                    &[
+                        (w!("左键"), w!("锁定自动选区")),
+                        (w!("左键拖动"), w!("手动框选")),
+                        (w!("Esc"), w!("退出截图")),
+                    ]
+                }
+            }
+            Self::Selected => {
+                const {
+                    &[
+                        (w!("框内拖动"), w!("移动选区")),
+                        (w!("边线拖动"), w!("调整选区大小")),
+                        (w!("右键"), w!("返回自动框选")),
+                        (w!("Ctrl+C"), w!("复制截图")),
+                        (w!("Esc"), w!("退出截图")),
+                    ]
+                }
+            }
+            Self::Annotate(Tool::Rectangle) => {
+                const {
+                    &[
+                        (w!("左键拖动"), w!("绘制矩形")),
+                        (w!("Ctrl+1"), w!("退出矩形工具")),
+                        (w!("Ctrl+5"), w!("撤回标注")),
+                    ]
+                }
+            }
+            Self::Annotate(Tool::Text) => {
+                const {
+                    &[
+                        (w!("左键"), w!("插入文本框")),
+                        (w!("左键拖动"), w!("指定文本框大小")),
+                        (w!("Ctrl+2"), w!("退出文本工具")),
+                    ]
+                }
+            }
+            Self::Annotate(Tool::Brush) => {
+                const {
+                    &[
+                        (w!("左键拖动"), w!("自由绘制")),
+                        (w!("Ctrl+3"), w!("退出画笔工具")),
+                        (w!("Ctrl+5"), w!("撤回标注")),
+                    ]
+                }
+            }
+            Self::Annotate(Tool::Mosaic) => {
+                const {
+                    &[
+                        (w!("左键拖动"), w!("框选马赛克范围")),
+                        (w!("Ctrl+4"), w!("退出马赛克工具")),
+                        (w!("Ctrl+5"), w!("撤回标注")),
+                    ]
+                }
+            }
+            Self::EditText => {
+                const {
+                    &[
+                        (w!("Enter"), w!("换行")),
+                        (w!("Ctrl+Enter"), w!("确认文本")),
+                        (w!("Esc"), w!("取消文本输入")),
+                    ]
+                }
+            }
+        }
+    }
 }
 
 impl HintPanel {
     pub unsafe fn new(source: HDC, work_area: RECT) -> io::Result<Self> {
         let width = PANEL_WIDTH.min(work_area.right - work_area.left);
-        let height = PANEL_HEIGHT.min(work_area.bottom - work_area.top);
+        let max_height = PANEL_HEIGHT.min(work_area.bottom - work_area.top);
         let left = (work_area.left + PANEL_MARGIN).min(work_area.right - width);
-        let top = (work_area.bottom - PANEL_MARGIN - height).max(work_area.top);
-        let bounds = RECT {
-            left,
-            top,
-            right: left + width,
-            bottom: top + height,
+        let bottom = (work_area.bottom - PANEL_MARGIN).max(work_area.top + max_height);
+        let surface = Surface::new(source, width, max_height)?;
+        let mut hint = Self {
+            bounds: RECT {
+                left,
+                right: left + width,
+                top: bottom,
+                bottom,
+            },
+            surface,
+            max_height,
+            bottom,
+            mode: None,
         };
-        let surface = Surface::new(source, width, height)?;
+        hint.set_mode(source, HintMode::Automatic);
+        Ok(hint)
+    }
+
+    pub unsafe fn set_mode(&mut self, source: HDC, mode: HintMode) -> Option<[RECT; 2]> {
+        if self.mode == Some(mode) {
+            return None;
+        }
+        let previous = self.bounds;
+        self.mode = Some(mode);
+        let rows = mode.rows();
+        let height = (rows.len() as i32 * ROW_HEIGHT + 2 * PANEL_INSET).min(self.max_height);
+        self.bounds.top = self.bottom - height;
+        let width = self.bounds.right - self.bounds.left;
+        let surface = &self.surface;
         let panel = RECT {
             right: width,
             bottom: height,
@@ -59,13 +165,23 @@ impl HintPanel {
             ..Default::default()
         };
         AlphaBlend(
-            surface.dc, 0, 0, width, height, source, left, top, width, height, blend,
+            surface.dc,
+            0,
+            0,
+            width,
+            height,
+            source,
+            self.bounds.left,
+            self.bounds.top,
+            width,
+            height,
+            blend,
         );
-        SetDCBrushColor(surface.dc, 0x0040_4040);
+        SetDCBrushColor(surface.dc, 0x0060_6060);
         FrameRect(surface.dc, &panel, brush);
         SetBkMode(surface.dc, TRANSPARENT as i32);
         let font = CreateFontW(
-            -18,
+            -16,
             0,
             0,
             0,
@@ -76,7 +192,7 @@ impl HintPanel {
             DEFAULT_CHARSET as u32,
             OUT_DEFAULT_PRECIS as u32,
             CLIP_DEFAULT_PRECIS as u32,
-            CLEARTYPE_QUALITY as u32,
+            ANTIALIASED_QUALITY as u32,
             DEFAULT_PITCH as u32,
             w!("Microsoft YaHei UI"),
         );
@@ -86,33 +202,51 @@ impl HintPanel {
             font
         };
         let previous_font = SelectObject(surface.dc, selected_font);
-        for (row, label, color) in [
-            (0, w!("Snapshot  ·  截图快捷操作"), 0x00ff_ffff),
-            (1, w!("单击锁定  ·  拖动框选"), 0x00df_dfdf),
-            (2, w!("拖框移动  ·  拖边缩放"), 0x00df_dfdf),
-            (3, w!("右键重选  ·  Esc 退出"), 0x00df_dfdf),
-            (4, w!("Enter 复制  ·  Ctrl+S 保存"), 0x00df_dfdf),
-        ] {
-            let mut line = RECT {
-                left: 16,
-                top: 9 + row * 24,
-                right: width - 14,
-                bottom: 33 + row * 24,
+        let split = (width * 2 / 5).min(126);
+        for (index, &(key, description)) in rows.iter().enumerate() {
+            let top = PANEL_INSET + index as i32 * ROW_HEIGHT;
+            let mut size = RECT::default();
+            DrawTextW(surface.dc, key, -1, &mut size, DT_SINGLELINE | DT_CALCRECT);
+            let mut badge = RECT {
+                left: (split - size.right - 14).max(6),
+                top: top + 2,
+                right: split,
+                bottom: top + ROW_HEIGHT - 2,
             };
-            SetTextColor(surface.dc, color);
+            SetDCBrushColor(surface.dc, 0x0036_3636);
+            FillRect(surface.dc, &badge, brush);
+            SetDCBrushColor(surface.dc, 0x0078_7878);
+            FrameRect(surface.dc, &badge, brush);
+            badge.left += 3;
+            badge.right -= 7;
+            SetTextColor(surface.dc, 0x00ff_ffff);
             DrawTextW(
                 surface.dc,
-                label,
+                key,
                 -1,
-                &mut line,
-                DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                &mut badge,
+                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+            let mut detail = RECT {
+                left: split + 11,
+                top,
+                right: width - 10,
+                bottom: top + ROW_HEIGHT,
+            };
+            SetTextColor(surface.dc, 0x00df_dfdf);
+            DrawTextW(
+                surface.dc,
+                description,
+                -1,
+                &mut detail,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
             );
         }
         SelectObject(surface.dc, previous_font);
         if !font.is_null() {
             DeleteObject(font);
         }
-        Ok(Self { bounds, surface })
+        Some([previous, self.bounds])
     }
 
     pub unsafe fn paint(&self, dc: HDC, dirty: RECT) {
@@ -257,6 +391,28 @@ impl Loupe {
 mod tests {
     use super::*;
     use std::ptr::null_mut;
+
+    #[test]
+    fn hint_rows_refresh_by_mode_and_keep_the_bottom_anchor() {
+        unsafe {
+            let area = RECT {
+                right: 800,
+                bottom: 600,
+                ..Default::default()
+            };
+            let source = Surface::new(null_mut(), area.right, area.bottom).unwrap();
+            let mut hint = HintPanel::new(source.dc, area).unwrap();
+            let automatic = hint.bounds;
+            let [before, selected] = hint.set_mode(source.dc, HintMode::Selected).unwrap();
+            assert_eq!(before.top, automatic.top);
+            assert_eq!(selected.bottom, automatic.bottom);
+            assert_eq!(automatic.top - selected.top, 2 * ROW_HEIGHT);
+            assert!(hint.set_mode(source.dc, HintMode::Selected).is_none());
+            let [_, text] = hint.set_mode(source.dc, HintMode::EditText).unwrap();
+            assert_eq!(text.top, automatic.top);
+            assert_eq!(text.bottom, automatic.bottom);
+        }
+    }
 
     #[test]
     fn loupe_draws_both_guides_without_covering_the_sampled_pixel() {

@@ -15,7 +15,7 @@ use windows::{
         UI::Accessibility::{
             CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest,
             IUIAutomationCondition, TreeScope_Children, UIA_BoundingRectanglePropertyId,
-            UIA_IsOffscreenPropertyId,
+            UIA_ControlTypePropertyId, UIA_IsOffscreenPropertyId, UIA_TextControlTypeId,
         },
     },
 };
@@ -96,7 +96,13 @@ pub struct Request {
 
 pub struct ElementMatch {
     pub request: Request,
-    pub rect: Option<RECT>,
+    pub region: Option<ElementRegion>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ElementRegion {
+    pub rect: RECT,
+    pub weak: bool,
 }
 
 pub struct ElementProbe {
@@ -136,15 +142,13 @@ impl ElementProbe {
                         let Some(request) = request else {
                             continue;
                         };
-                        let rect = automation.find(request).ok().flatten();
+                        let region = automation.find(request).ok().flatten();
                         // Browsers can expose their web accessibility tree after the first query.
-                        if seen.insert(request.window.id)
-                            && rect
-                                .is_none_or(|rect| area(rect) * 10 >= area(request.window.rect) * 9)
+                        if seen.insert(request.window.id) && region.is_none_or(|region| region.weak)
                         {
                             retry = Some(request);
                         }
-                        if publish.send(ElementMatch { request, rect }).is_err() {
+                        if publish.send(ElementMatch { request, region }).is_err() {
                             break;
                         }
                         PostMessageW(overlay as HWND, ELEMENT_READY, 0, 0);
@@ -186,6 +190,7 @@ impl Automation {
         let cache = client.CreateCacheRequest()?;
         cache.AddProperty(UIA_BoundingRectanglePropertyId)?;
         cache.AddProperty(UIA_IsOffscreenPropertyId)?;
+        cache.AddProperty(UIA_ControlTypePropertyId)?;
         let condition = client.CreateTrueCondition()?;
         Ok(Self {
             client,
@@ -194,14 +199,14 @@ impl Automation {
         })
     }
 
-    unsafe fn find(&self, request: Request) -> windows::core::Result<Option<RECT>> {
+    unsafe fn find(&self, request: Request) -> windows::core::Result<Option<ElementRegion>> {
         let deadline = Instant::now() + Duration::from_millis(100);
         let root = self
             .client
             .ElementFromHandle(AutomationHwnd(request.window.id as _))?;
         let mut candidates = vec![(root, request.window.rect)];
         let mut best = None;
-        let mut smallest = i64::MAX;
+        let mut score = (true, i64::MAX);
         for _ in 0..32 {
             if Instant::now() >= deadline {
                 break;
@@ -230,6 +235,11 @@ impl Automation {
                 let Ok(bounds) = child.CachedBoundingRectangle() else {
                     continue;
                 };
+                if bounds.left >= bounds.right || bounds.top >= bounds.bottom {
+                    // Virtual accessibility groups can have no rectangle of their own.
+                    candidates.push((child, parent_rect));
+                    continue;
+                }
                 let Some(rect) = intersect(
                     parent_rect,
                     RECT {
@@ -243,9 +253,13 @@ impl Automation {
                 };
                 if contains(rect, request.point) {
                     let size = area(rect);
-                    if size < smallest {
-                        smallest = size;
-                        best = Some(rect);
+                    let weak = size * 10 >= area(request.window.rect) * 9
+                        || child
+                            .CachedControlType()
+                            .is_ok_and(|kind| kind == UIA_TextControlTypeId);
+                    if (weak, size) < score {
+                        score = (weak, size);
+                        best = Some(ElementRegion { rect, weak });
                     }
                     candidates.push((child, rect));
                 }
