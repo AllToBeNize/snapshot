@@ -55,6 +55,7 @@ pub enum HintMode {
     Automatic,
     Selected,
     Annotate(Tool),
+    SelectedText,
     EditText,
 }
 
@@ -115,9 +116,20 @@ impl HintMode {
             Self::Annotate(Tool::Mosaic) => {
                 const {
                     &[
-                        (Mouse(Icon::Drag), w!("框选马赛克范围")),
+                        (Mouse(Icon::Drag), w!("涂抹马赛克")),
                         (Bound(Binding::Mosaic), w!("退出马赛克工具")),
                         (Bound(Binding::Undo), w!("撤回标注")),
+                    ]
+                }
+            }
+            Self::SelectedText => {
+                const {
+                    &[
+                        (Mouse(Icon::MouseLeft), w!("双击文本框编辑")),
+                        (Mouse(Icon::Move), w!("拖动文本框移动")),
+                        (Mouse(Icon::Resize), w!("拖动四角缩放")),
+                        (Mouse(Icon::Drag), w!("拖动上方圆点旋转")),
+                        (Bound(Binding::Undo), w!("撤回上一步")),
                     ]
                 }
             }

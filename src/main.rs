@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod annotation;
+mod annotation_options;
 mod capture;
 mod hotkey;
 mod icons;
@@ -14,6 +15,7 @@ mod selection;
 mod selection_geometry;
 mod settings;
 mod targets;
+mod text_mark;
 mod toolbar;
 mod typography;
 

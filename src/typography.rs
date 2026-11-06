@@ -1,11 +1,13 @@
-use std::cell::LazyCell;
+use std::{
+    cell::{LazyCell, RefCell},
+    collections::HashMap,
+};
 use windows_sys::{core::w, Win32::Graphics::Gdi::*};
 
 #[derive(Clone, Copy)]
 pub enum TextStyle {
     Ui,
     Compact,
-    Annotation,
     HintDescription,
     Dimensions,
 }
@@ -47,7 +49,7 @@ impl Drop for Font {
 thread_local! {
     static UI: LazyCell<Font> = const { LazyCell::new(|| Font::new(15, w!("Segoe UI"))) };
     static COMPACT: LazyCell<Font> = const { LazyCell::new(|| Font::new(13, w!("Segoe UI"))) };
-    static ANNOTATION: LazyCell<Font> = const { LazyCell::new(|| Font::new(16, w!("Segoe UI"))) };
+    static ANNOTATION: RefCell<HashMap<i32, Font>> = RefCell::new(HashMap::new());
     static HINT_DESCRIPTION: LazyCell<Font> = const { LazyCell::new(|| Font::new(15, w!("Microsoft YaHei"))) };
     static DIMENSIONS: LazyCell<Font> = const { LazyCell::new(|| Font::new(16, w!("Segoe UI"))) };
 }
@@ -56,7 +58,6 @@ pub fn font(style: TextStyle) -> HFONT {
     let font = match style {
         TextStyle::Ui => UI.with(|font| font.0),
         TextStyle::Compact => COMPACT.with(|font| font.0),
-        TextStyle::Annotation => ANNOTATION.with(|font| font.0),
         TextStyle::HintDescription => HINT_DESCRIPTION.with(|font| font.0),
         TextStyle::Dimensions => DIMENSIONS.with(|font| font.0),
     };
@@ -65,4 +66,18 @@ pub fn font(style: TextStyle) -> HFONT {
     } else {
         font
     }
+}
+
+pub fn annotation_font(size: i32) -> HFONT {
+    ANNOTATION.with_borrow_mut(|fonts| {
+        let font = fonts
+            .entry(size)
+            .or_insert_with(|| Font::new(size, w!("Microsoft YaHei")))
+            .0;
+        if font.is_null() {
+            unsafe { GetStockObject(DEFAULT_GUI_FONT) }
+        } else {
+            font
+        }
+    })
 }

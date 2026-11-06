@@ -1,7 +1,13 @@
 mod phosphor;
 
-use std::{cell::RefCell, collections::HashMap};
-use windows_sys::Win32::{Foundation::RECT, Graphics::Gdi::*};
+use std::{cell::RefCell, collections::HashMap, ptr::null_mut};
+use windows_sys::Win32::{
+    Foundation::RECT,
+    Graphics::Gdi::*,
+    UI::WindowsAndMessaging::{
+        CreateIconIndirect, DestroyCursor, GetCursor, SetCursor, HCURSOR, ICONINFO,
+    },
+};
 
 use crate::capture::{Image, Surface};
 
@@ -23,6 +29,90 @@ pub enum Icon {
     Drag,
     Move,
     Resize,
+}
+
+pub struct Cursor(pub HCURSOR);
+
+impl Cursor {
+    pub fn brush() -> Option<Self> {
+        let mut image = tinted_icon(Icon::Brush, 24, 0x001a_1a1a);
+        let ink = image.pixels.clone();
+        for y in 0..24_usize {
+            for x in 0..24_usize {
+                let offset = (y * 24 + x) * 4;
+                if ink[offset + 3] == 0
+                    && (y.saturating_sub(1)..=(y + 1).min(23)).any(|row| {
+                        (x.saturating_sub(1)..=(x + 1).min(23))
+                            .any(|col| ink[(row * 24 + col) * 4 + 3] > 100)
+                    })
+                {
+                    image.pixels[offset..offset + 4].fill(255);
+                }
+            }
+        }
+        Self::new(image, 4, 20)
+    }
+
+    pub fn mosaic(diameter: i32) -> Option<Self> {
+        let size = diameter + 4;
+        let center = size / 2;
+        let radius = f64::from(diameter) / 2.0;
+        let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+        for y in 0..size {
+            for x in 0..size {
+                let distance = (f64::from(x - center).hypot(f64::from(y - center)) - radius).abs();
+                let pixel = if distance <= 0.65 {
+                    [20, 20, 20, 255]
+                } else if distance <= 1.65 {
+                    [255; 4]
+                } else {
+                    [0; 4]
+                };
+                pixels.extend_from_slice(&pixel);
+            }
+        }
+        Self::new(
+            Image {
+                width: size,
+                height: size,
+                pixels,
+            },
+            center as u32,
+            center as u32,
+        )
+    }
+
+    fn new(image: Image, x: u32, y: u32) -> Option<Self> {
+        unsafe {
+            let (surface, width, height) = image.into_surface().ok()?;
+            let mask_stride = (width as usize).div_ceil(16) * 2;
+            let mask_bits = vec![0_u8; mask_stride * height as usize];
+            let mask = CreateBitmap(width, height, 1, 1, mask_bits.as_ptr().cast());
+            if mask.is_null() {
+                return None;
+            }
+            let cursor = CreateIconIndirect(&ICONINFO {
+                fIcon: 0,
+                xHotspot: x,
+                yHotspot: y,
+                hbmMask: mask,
+                hbmColor: surface.bitmap(),
+            });
+            DeleteObject(mask);
+            (!cursor.is_null()).then_some(Self(cursor))
+        }
+    }
+}
+
+impl Drop for Cursor {
+    fn drop(&mut self) {
+        unsafe {
+            if GetCursor() == self.0 {
+                SetCursor(null_mut());
+            }
+            DestroyCursor(self.0);
+        }
+    }
 }
 
 const MAX_CACHED_TILES: usize = 96;
@@ -191,4 +281,10 @@ mod tests {
         assert_eq!(alpha(12, 5), 0);
         assert_eq!(alpha(5, 12), 0);
     }
+}
+#[test]
+fn creates_native_cursors_for_the_brush_and_mosaic_size_limits() {
+    assert!(Cursor::brush().is_some());
+    assert!(Cursor::mosaic(4).is_some());
+    assert!(Cursor::mosaic(128).is_some());
 }

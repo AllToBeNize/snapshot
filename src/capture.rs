@@ -217,6 +217,10 @@ impl Desktop {
 }
 
 impl Surface {
+    pub fn bitmap(&self) -> HBITMAP {
+        self.bitmap
+    }
+
     pub unsafe fn new(reference: HDC, width: i32, height: i32) -> io::Result<Self> {
         let dc = CreateCompatibleDC(reference);
         if dc.is_null() {

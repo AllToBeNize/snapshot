@@ -1,5 +1,6 @@
 use crate::{
     annotation::{History, Tool},
+    annotation_options::Options,
     hotkey::Binding,
     icons::{self, Icon},
     selection_geometry::contains,
@@ -89,6 +90,10 @@ pub struct Toolbar {
 }
 
 impl Toolbar {
+    pub fn options(self, tool: Tool, selection: RECT) -> Option<Options> {
+        Options::new(tool, self.bounds, self.area, selection)
+    }
+
     pub fn new(selection: RECT, area: RECT) -> Option<Self> {
         let spacing = GROUP_GAP + PADDING * 2;
         let count = ACTIONS.len() as i32;
