@@ -26,6 +26,31 @@ Windows 10 及 Windows 11 截图原型。启动后驻留系统托盘。
 
 ## 构建
 
+Windows x64 需要安装 [Rust MSVC 工具链](https://rustup.rs/) 和 Visual Studio C++ 生成工具（含 Windows SDK）。CLI 会自动查找用户目录下的 Cargo 和 Visual Studio 开发环境，可在普通 PowerShell 中运行。
+
+```powershell
+.\snapshot.ps1 build
+.\snapshot.ps1 test
+.\snapshot.ps1 package
+```
+
+`package` 先运行测试再构建，生成 `dist/snapshot-v<版本>-windows-x64.zip` 和对应的 `.sha256` 校验文件。ZIP 包含可执行文件、使用说明及许可证，解压后运行 `snapshot.exe`。CLI 构建的独立可执行文件位于 `target/x86_64-pc-windows-msvc/release/snapshot.exe`。
+
+### GitHub Release
+
+安装 [GitHub CLI](https://cli.github.com/)，执行 `gh auth login`。更新 `Cargo.toml` 版本后运行一次构建以同步 `Cargo.lock`，提交所有修改，再创建并推送对应标签：
+
+```powershell
+git tag v0.1.0
+git push origin HEAD
+git push origin v0.1.0
+.\snapshot.ps1 release -Tag v0.1.0
+```
+
+将示例版本替换为实际版本。`release` 要求工作区干净且远端标签指向当前提交，随后测试、构建、打包并上传 ZIP 和 SHA256，创建带自动生成说明的 Release 草稿。在 GitHub 检查草稿后点击发布。同一标签已有 Release 时命令会失败，不会覆盖它。
+
+也可以直接使用 Cargo：
+
 ```powershell
 cargo build --release --locked
 .\target\release\snapshot.exe
