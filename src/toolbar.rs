@@ -1,4 +1,10 @@
-use crate::{annotation::Tool, selection_geometry::contains};
+use crate::{
+    annotation::{History, Tool},
+    hotkey::Binding,
+    icons::{self, Icon},
+    selection_geometry::contains,
+    typography::{self, TextStyle},
+};
 use windows_sys::{
     core::w,
     Win32::{
@@ -12,52 +18,85 @@ pub enum Action {
     Tool(Tool),
     Undo,
     Redo,
+    ScrollCapture,
     Copy,
     Save,
     Pin,
+    Cancel,
 }
 
-pub const ACTIONS: [Action; 9] = [
+impl Action {
+    pub fn from_binding(binding: Binding) -> Option<Self> {
+        Some(match binding {
+            Binding::Capture => return None,
+            Binding::Rectangle => Self::Tool(Tool::Rectangle),
+            Binding::Text => Self::Tool(Tool::Text),
+            Binding::Brush => Self::Tool(Tool::Brush),
+            Binding::Mosaic => Self::Tool(Tool::Mosaic),
+            Binding::Undo => Self::Undo,
+            Binding::Redo => Self::Redo,
+            Binding::LongCapture => Self::ScrollCapture,
+            Binding::Copy => Self::Copy,
+            Binding::Save => Self::Save,
+            Binding::Pin => Self::Pin,
+        })
+    }
+
+    pub fn enabled(self, history: &History) -> bool {
+        match self {
+            Self::Undo => history.draft.is_none() && history.has_marks(),
+            Self::Redo => history.draft.is_none() && history.can_redo(),
+            _ => true,
+        }
+    }
+}
+
+pub const ACTIONS: [Action; 10] = [
     Action::Tool(Tool::Rectangle),
     Action::Tool(Tool::Text),
     Action::Tool(Tool::Brush),
     Action::Tool(Tool::Mosaic),
     Action::Undo,
     Action::Redo,
+    Action::ScrollCapture,
     Action::Copy,
     Action::Save,
     Action::Pin,
 ];
-const LABELS: [*const u16; 9] = [
+const LABELS: [*const u16; ACTIONS.len()] = [
     w!("矩形"),
     w!("文本"),
     w!("画笔"),
     w!("马赛克"),
     w!("撤回"),
     w!("重做"),
+    w!("长截图"),
     w!("复制"),
     w!("保存"),
     w!("贴图"),
 ];
-const OFFSET: i32 = 8;
-const GROUP_GAP: i32 = 9;
-const PADDING: i32 = 4;
-const HEIGHT: i32 = 36;
+const OFFSET: i32 = 5;
+const GROUP_GAP: i32 = 7;
+const PADDING: i32 = 3;
+const HEIGHT: i32 = 30;
+const DISABLED_ICON: u32 = 0x00b9_b9b9;
 
 #[derive(Clone, Copy)]
 pub struct Toolbar {
     pub bounds: RECT,
     cell: i32,
+    area: RECT,
 }
 
 impl Toolbar {
     pub fn new(selection: RECT, area: RECT) -> Option<Self> {
         let spacing = GROUP_GAP + PADDING * 2;
-        let cell = ((area.right - area.left - spacing) / 9).min(46);
+        let count = ACTIONS.len() as i32;
+        let cell = ((area.right - area.left - spacing) / count).min(28);
         if cell < 12 || area.bottom - area.top < HEIGHT {
             return None;
         }
-        let width = cell * 9 + spacing;
+        let width = cell * count + spacing;
         let left = (selection.right - width).clamp(area.left, area.right - width);
         let below = selection.bottom + OFFSET;
         let top = if below + HEIGHT <= area.bottom {
@@ -73,6 +112,7 @@ impl Toolbar {
                 bottom: top + HEIGHT,
             },
             cell,
+            area,
         })
     }
 
@@ -97,52 +137,164 @@ impl Toolbar {
             .find_map(|(index, action)| contains(self.button(index), point).then_some(action))
     }
 
-    pub unsafe fn paint(self, dc: HDC, active: Option<Tool>, hovered: Option<Action>) {
+    pub unsafe fn paint(self, dc: HDC, history: &History, hovered: Option<Action>) {
         let saved = SaveDC(dc);
         if saved == 0 {
             return;
         }
-        let brush = GetStockObject(DC_BRUSH);
-        SelectObject(dc, brush);
-        SelectObject(dc, GetStockObject(DC_PEN));
-        SetDCBrushColor(dc, 0x00ff_ffff);
-        SetDCPenColor(dc, 0x00e5_e5e5);
-        rounded(dc, self.bounds, 11);
+        paint_panel(dc, self.bounds);
 
         let divider = self.bounds.left + PADDING + self.cell * 6 + GROUP_GAP / 2;
         let line = RECT {
             left: divider,
             right: divider + 1,
-            top: self.bounds.top + 10,
-            bottom: self.bounds.bottom - 10,
+            top: self.bounds.top + 7,
+            bottom: self.bounds.bottom - 7,
         };
         SetDCBrushColor(dc, 0x00e9_e9e9);
-        FillRect(dc, &line, brush);
+        FillRect(dc, &line, GetStockObject(DC_BRUSH));
 
-        SelectObject(dc, GetStockObject(NULL_PEN));
-        SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
-        SetBkMode(dc, TRANSPARENT as i32);
         for (index, action) in ACTIONS.iter().enumerate() {
-            let mut rect = self.button(index);
-            let selected = active.is_some_and(|tool| *action == Action::Tool(tool));
-            let (background, text) = match (selected, hovered == Some(*action)) {
-                (true, true) => (0x00fa_e6d8, 0x008b_4c22),
-                (true, false) => (0x00fc_eee4, 0x008b_4c22),
-                (false, true) => (0x00f8_f1eb, 0x0044_3328),
-                (false, false) => (0x00f9_f9f9, 0x0050_4945),
-            };
-            SetDCBrushColor(dc, background);
-            rounded(dc, rect, 7);
-            SetTextColor(dc, text);
-            DrawTextW(
+            let rect = self.button(index);
+            let selected = history
+                .tool
+                .is_some_and(|tool| *action == Action::Tool(tool));
+            paint_button(
                 dc,
-                LABELS[index],
-                -1,
-                &mut rect,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                rect,
+                *action,
+                action.enabled(history),
+                selected,
+                hovered == Some(*action),
             );
         }
         RestoreDC(dc, saved);
+    }
+
+    pub fn tooltip(self, action: Action) -> Option<(RECT, *const u16)> {
+        let index = ACTIONS.iter().position(|&candidate| candidate == action)?;
+        let button = self.button(index);
+        let width = 66;
+        let height = 24;
+        let left = ((button.left + button.right - width) / 2)
+            .clamp(self.area.left, self.area.right - width);
+        let above = self.bounds.top - height - 4;
+        let top = if above >= self.area.top {
+            above
+        } else if self.bounds.bottom + 4 + height <= self.area.bottom {
+            self.bounds.bottom + 4
+        } else {
+            return None;
+        };
+        Some((
+            RECT {
+                left,
+                top,
+                right: left + width,
+                bottom: top + height,
+            },
+            LABELS[index],
+        ))
+    }
+}
+
+pub unsafe fn paint_panel(dc: HDC, bounds: RECT) {
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    SelectObject(dc, GetStockObject(DC_PEN));
+    SetDCBrushColor(dc, 0x00ff_ffff);
+    SetDCPenColor(dc, 0x00d9_d9d9);
+    rounded(dc, bounds, 6);
+}
+
+pub unsafe fn paint_button(
+    dc: HDC,
+    rect: RECT,
+    action: Action,
+    enabled: bool,
+    selected: bool,
+    hovered: bool,
+) {
+    let (background, foreground) = match (enabled, selected, hovered) {
+        (false, _, _) => (None, DISABLED_ICON),
+        (true, true, _) => (Some(0x00fc_eee4), 0x008b_4c22),
+        (true, false, true) => (Some(0x00f8_f1eb), 0x0044_3328),
+        (true, false, false) => (None, 0x0050_4945),
+    };
+    if let Some(background) = background {
+        SelectObject(dc, GetStockObject(DC_BRUSH));
+        SelectObject(dc, GetStockObject(NULL_PEN));
+        SetDCBrushColor(dc, background);
+        rounded(dc, rect, 5);
+    }
+    let size = (rect.right - rect.left - 2).min(18);
+    let left = (rect.left + rect.right - size) / 2;
+    let top = (rect.top + rect.bottom - size) / 2;
+    icons::paint(
+        dc,
+        RECT {
+            left,
+            top,
+            right: left + size,
+            bottom: top + size,
+        },
+        action_icon(action),
+        foreground,
+    );
+}
+
+pub unsafe fn paint_tooltip(dc: HDC, bounds: RECT, label: *const u16) {
+    paint_label(dc, bounds, label, 0x0034_302d, true);
+}
+
+pub unsafe fn paint_size_badge(dc: HDC, bounds: RECT, label: *const u16) {
+    paint_label(dc, bounds, label, 0, false);
+}
+
+unsafe fn paint_label(dc: HDC, mut bounds: RECT, label: *const u16, fill: u32, pill: bool) {
+    let saved = SaveDC(dc);
+    if saved == 0 {
+        return;
+    }
+    let brush = GetStockObject(DC_BRUSH);
+    SetDCBrushColor(dc, fill);
+    if pill {
+        SelectObject(dc, brush);
+        SelectObject(dc, GetStockObject(NULL_PEN));
+        rounded(dc, bounds, 7);
+    } else {
+        FillRect(dc, &bounds, brush);
+    }
+    let style = if pill {
+        TextStyle::Compact
+    } else {
+        TextStyle::Dimensions
+    };
+    SelectObject(dc, typography::font(style));
+    SetBkMode(dc, TRANSPARENT as i32);
+    SetTextColor(dc, 0x00ff_ffff);
+    DrawTextW(
+        dc,
+        label,
+        -1,
+        &mut bounds,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    RestoreDC(dc, saved);
+}
+
+fn action_icon(action: Action) -> Icon {
+    match action {
+        Action::Tool(Tool::Rectangle) => Icon::Rectangle,
+        Action::Tool(Tool::Text) => Icon::Text,
+        Action::Tool(Tool::Brush) => Icon::Brush,
+        Action::Tool(Tool::Mosaic) => Icon::Mosaic,
+        Action::Undo => Icon::Undo,
+        Action::Redo => Icon::Redo,
+        Action::ScrollCapture => Icon::LongCapture,
+        Action::Copy => Icon::Copy,
+        Action::Save => Icon::Save,
+        Action::Pin => Icon::Pin,
+        Action::Cancel => Icon::Close,
     }
 }
 
@@ -196,16 +348,37 @@ mod tests {
             .is_none());
         unsafe {
             let surface = Surface::new(null_mut(), area.right, area.bottom).unwrap();
-            toolbar.paint(surface.dc, None, hovered);
+            toolbar.paint(surface.dc, &History::default(), hovered);
             assert_eq!(GetPixel(surface.dc, point.x, point.y), 0x00f8_f1eb);
             assert_eq!(
                 GetPixel(surface.dc, point.x + toolbar.cell, point.y),
-                0x00f9_f9f9
+                0x00ff_ffff
             );
             assert_eq!(
                 GetPixel(surface.dc, divider, toolbar.bounds.top + 12),
                 0x00e9_e9e9
             );
         }
+    }
+
+    #[test]
+    fn undo_and_redo_follow_the_annotation_history() {
+        use crate::annotation::Mark;
+
+        let mut history = History::default();
+        assert!(!Action::Undo.enabled(&history));
+        assert!(!Action::Redo.enabled(&history));
+        history.push(Mark::Rectangle(RECT::default()));
+        assert!(Action::Undo.enabled(&history));
+        assert!(!Action::Redo.enabled(&history));
+        history.undo();
+        assert!(!Action::Undo.enabled(&history));
+        assert!(Action::Redo.enabled(&history));
+        history.redo();
+        assert!(Action::Undo.enabled(&history));
+        assert!(!Action::Redo.enabled(&history));
+        history.undo();
+        history.push(Mark::Rectangle(RECT::default()));
+        assert!(!Action::Redo.enabled(&history));
     }
 }

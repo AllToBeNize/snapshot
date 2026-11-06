@@ -1,21 +1,32 @@
 use std::{
+    ffi::OsString,
     fs::File,
-    io::{self, BufWriter},
+    io::{self, BufWriter, Write},
     mem::size_of,
-    path::Path,
+    os::windows::ffi::OsStringExt,
+    path::{Path, PathBuf},
     ptr::{null_mut, NonNull},
     slice,
 };
-use windows_sys::Win32::{
-    Foundation::{GlobalFree, HWND, RECT},
-    Graphics::Gdi::*,
-    System::{
-        DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
-        Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
-    },
-    UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-        SM_YVIRTUALSCREEN,
+use windows_sys::{
+    core::w,
+    Win32::{
+        Foundation::{GlobalFree, HWND, RECT},
+        Graphics::Gdi::*,
+        System::{
+            DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
+            Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
+        },
+        UI::{
+            Controls::Dialogs::{
+                CommDlgExtendedError, GetSaveFileNameW, OFN_EXPLORER, OFN_NOCHANGEDIR,
+                OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+            },
+            WindowsAndMessaging::{
+                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+                SM_YVIRTUALSCREEN,
+            },
+        },
     },
 };
 
@@ -32,6 +43,57 @@ pub struct Surface {
     bitmap: HBITMAP,
     previous_bitmap: HGDIOBJ,
     pixels: NonNull<u8>,
+}
+
+pub struct RegionCapture {
+    bounds: RECT,
+    surface: Surface,
+    len: usize,
+}
+
+impl RegionCapture {
+    pub fn new(bounds: RECT) -> io::Result<Self> {
+        let width = bounds.right - bounds.left;
+        let height = bounds.bottom - bounds.top;
+        let len = pixel_len(width, height)?;
+        let surface = unsafe { Surface::new(null_mut(), width, height)? };
+        Ok(Self {
+            bounds,
+            surface,
+            len,
+        })
+    }
+
+    pub fn sample(&mut self) -> io::Result<&[u8]> {
+        unsafe {
+            let screen = GetDC(null_mut());
+            if screen.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let bounds = self.bounds;
+            let copied = BitBlt(
+                self.surface.dc,
+                0,
+                0,
+                bounds.right - bounds.left,
+                bounds.bottom - bounds.top,
+                screen,
+                bounds.left,
+                bounds.top,
+                SRCCOPY | CAPTUREBLT,
+            );
+            let result = if copied == 0 || GdiFlush() == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(slice::from_raw_parts(
+                    self.surface.pixels.as_ptr(),
+                    self.len,
+                ))
+            };
+            ReleaseDC(null_mut(), screen);
+            result
+        }
+    }
 }
 
 impl Desktop {
@@ -201,12 +263,33 @@ impl Drop for Surface {
 }
 
 pub struct Image {
-    width: i32,
-    height: i32,
-    pixels: Vec<u8>,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) pixels: Vec<u8>,
 }
 
 impl Image {
+    pub unsafe fn blit(&self, dc: HDC, left: i32, top: i32) {
+        let info = BITMAPINFO {
+            bmiHeader: bitmap_header(self.width, self.height),
+            ..Default::default()
+        };
+        SetDIBitsToDevice(
+            dc,
+            left,
+            top,
+            self.width as u32,
+            self.height as u32,
+            0,
+            0,
+            0,
+            self.height as u32,
+            self.pixels.as_ptr().cast(),
+            &info,
+            DIB_RGB_COLORS,
+        );
+    }
+
     pub unsafe fn into_surface(self) -> io::Result<(Surface, i32, i32)> {
         let surface = Surface::new(null_mut(), self.width, self.height)?;
         surface
@@ -253,20 +336,55 @@ impl Image {
         Ok(())
     }
 
-    pub fn save_png(mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        for pixel in self.pixels.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
-            pixel.swap(0, 2);
-            pixel[3] = 255;
-        }
+    pub fn save_png(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let file = BufWriter::new(File::create(path)?);
         let mut encoder = png::Encoder::new(file, self.width as u32, self.height as u32);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header()?;
-        writer.write_image_data(&self.pixels)?;
+        let mut stream = writer.stream_writer()?;
+        let row_bytes = self.width as usize * BYTES_PER_PIXEL;
+        let mut rgba = Vec::with_capacity(row_bytes);
+        for row in self.pixels.chunks_exact(row_bytes) {
+            rgba.clear();
+            for &[b, g, r, _] in row.as_chunks::<BYTES_PER_PIXEL>().0 {
+                rgba.extend_from_slice(&[r, g, b, 255]);
+            }
+            stream.write_all(&rgba)?;
+        }
+        stream.finish()?;
         writer.finish()?;
         Ok(())
     }
+}
+
+pub unsafe fn save_path(window: HWND, default_name: &str) -> Result<Option<PathBuf>, String> {
+    let mut filename = [0u16; 1024];
+    let default_name: Vec<u16> = default_name.encode_utf16().collect();
+    filename[..default_name.len()].copy_from_slice(&default_name);
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: window,
+        lpstrFilter: w!("PNG 图片 (*.png)\0*.png\0"),
+        lpstrFile: filename.as_mut_ptr(),
+        nMaxFile: filename.len() as u32,
+        Flags: OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        lpstrDefExt: w!("png"),
+        ..Default::default()
+    };
+    if GetSaveFileNameW(&mut dialog) == 0 {
+        let error = CommDlgExtendedError();
+        return if error == 0 {
+            Ok(None)
+        } else {
+            Err(format!("保存对话框错误 {error:#x}"))
+        };
+    }
+    let end = filename
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(filename.len());
+    Ok(Some(OsString::from_wide(&filename[..end]).into()))
 }
 
 fn bitmap_header(width: i32, height: i32) -> BITMAPINFOHEADER {

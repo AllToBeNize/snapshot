@@ -3,7 +3,11 @@ use windows_sys::Win32::{
     Graphics::Gdi::*,
 };
 
-use crate::{capture::Surface, selection_geometry::intersect};
+use crate::{
+    capture::Surface,
+    selection_geometry::intersect,
+    typography::{self, TextStyle},
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -36,6 +40,14 @@ pub struct History {
 }
 
 impl History {
+    pub fn has_marks(&self) -> bool {
+        !self.marks.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.undone.is_empty()
+    }
+
     pub fn push(&mut self, mark: Mark) {
         self.undone.clear();
         self.marks.push(mark);
@@ -107,6 +119,10 @@ impl Draft {
             right: self.start.x.max(self.end.x) + 1,
             bottom: self.start.y.max(self.end.y) + 1,
         }
+    }
+
+    pub fn has_extent(&self) -> bool {
+        self.start.x != self.end.x || self.start.y != self.end.y
     }
 
     pub fn text_rect(&self, clip: RECT) -> RECT {
@@ -181,7 +197,7 @@ impl Mark {
             }
             Self::Text(bounds, text) => {
                 FillRect(dc, bounds, GetStockObject(WHITE_BRUSH));
-                let previous = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+                let previous = SelectObject(dc, typography::font(TextStyle::Annotation));
                 SetBkMode(dc, TRANSPARENT as i32);
                 SetTextColor(dc, 0);
                 let mut text_rect = intersect(

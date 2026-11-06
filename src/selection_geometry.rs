@@ -1,6 +1,7 @@
 use windows_sys::Win32::Foundation::{POINT, RECT};
 
 pub const HANDLE_RADIUS: i32 = 4;
+pub const BORDER_BLUE: u32 = 0x00ff_8a26;
 const EDGE_HIT_RADIUS: i32 = 6;
 pub const HANDLES: [Handle; 8] = [
     Handle(-1, -1),

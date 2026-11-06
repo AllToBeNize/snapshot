@@ -3,18 +3,24 @@
 mod annotation;
 mod capture;
 mod hotkey;
+mod icons;
 mod overlay_ui;
 mod panel_edges;
 mod pinned;
+mod scroll_capture;
+mod scroll_input;
+mod scroll_stitch;
 mod selection;
 mod selection_geometry;
+mod settings;
 mod targets;
 mod toolbar;
+mod typography;
 
 use std::{
+    cell::Cell,
     io,
     mem::size_of,
-    process::Command,
     ptr::{null, null_mut},
     sync::OnceLock,
 };
@@ -25,9 +31,9 @@ use windows_sys::{
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
-            Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey},
+            Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT},
             Shell::{
-                Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+                Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
                 NOTIFYICONDATAW,
             },
             WindowsAndMessaging::*,
@@ -36,12 +42,13 @@ use windows_sys::{
 };
 
 const TRAY_MESSAGE: u32 = WM_APP + 1;
-const HOTKEY_ID: i32 = 1;
 const MENU_CAPTURE: usize = 1;
 const MENU_CONFIG: usize = 2;
 const MENU_EXIT: usize = 3;
-static CONFIG: OnceLock<hotkey::Config> = OnceLock::new();
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
+thread_local! {
+    static HOTKEY_ID: Cell<i32> = const { Cell::new(1) };
+}
 
 fn main() {
     if let Err(error) = unsafe { run() } {
@@ -57,11 +64,15 @@ unsafe fn run() -> Result<(), String> {
             io::Error::last_os_error()
         ));
     }
-    let config = hotkey::Config::load()?;
-    let config = CONFIG.get_or_init(|| config);
+    let preferences = hotkey::load()?;
+    let bindings = preferences.bindings;
+    hotkey::activate(bindings);
+    pinned::set_opacity_step(preferences.opacity_step);
     let instance = GetModuleHandleW(null());
     selection::register(instance).map_err(|error| error.to_string())?;
+    scroll_capture::register(instance).map_err(|error| error.to_string())?;
     pinned::register(instance).map_err(|error| error.to_string())?;
+    settings::register(instance).map_err(|error| error.to_string())?;
     TASKBAR_CREATED.get_or_init(|| RegisterWindowMessageW(w!("TaskbarCreated")));
     let class = WNDCLASSW {
         lpfnWndProc: Some(tray_proc),
@@ -90,13 +101,19 @@ unsafe fn run() -> Result<(), String> {
         return Err(io::Error::last_os_error().to_string());
     }
 
-    if RegisterHotKey(window, HOTKEY_ID, config.modifiers, config.key) == 0 {
+    let capture = bindings.get(hotkey::Binding::Capture);
+    if RegisterHotKey(
+        window,
+        HOTKEY_ID.get(),
+        capture.modifiers | MOD_NOREPEAT,
+        capture.key,
+    ) == 0
+    {
         let error = io::Error::last_os_error();
         DestroyWindow(window);
         return Err(format!(
-            "无法注册快捷键 {}。请关闭占用该快捷键的程序，或编辑 {} 后重启 Snapshot。\n{error}",
-            config.label,
-            config.path.display()
+            "无法注册快捷键 {}。请关闭占用该快捷键的程序，或检查快捷键配置。\n{error}",
+            capture.label(),
         ));
     }
     if !tray_icon(window, NIM_ADD) {
@@ -114,8 +131,10 @@ unsafe fn run() -> Result<(), String> {
             }
             0 => return Ok(()),
             _ => {
-                TranslateMessage(&message);
-                DispatchMessageW(&message);
+                if !settings::dialog_message(&mut message) {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
             }
         }
     }
@@ -128,7 +147,7 @@ unsafe extern "system" fn tray_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
-        WM_HOTKEY if wparam == HOTKEY_ID as usize => begin_capture(window),
+        WM_HOTKEY if wparam == HOTKEY_ID.get() as usize => begin_capture(window),
         TRAY_MESSAGE => match lparam as u32 {
             WM_RBUTTONUP => tray_menu(window),
             WM_LBUTTONDBLCLK => begin_capture(window),
@@ -139,7 +158,7 @@ unsafe extern "system" fn tray_proc(
         }
         WM_DESTROY => {
             tray_icon(window, NIM_DELETE);
-            UnregisterHotKey(window, HOTKEY_ID);
+            UnregisterHotKey(window, HOTKEY_ID.get());
             PostQuitMessage(0);
         }
         taskbar_created if TASKBAR_CREATED.get() == Some(&taskbar_created) => {
@@ -151,7 +170,6 @@ unsafe extern "system" fn tray_proc(
 }
 
 unsafe fn tray_icon(window: HWND, message: u32) -> bool {
-    let config = CONFIG.get().expect("configuration initialized");
     let mut icon = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: window,
@@ -161,7 +179,10 @@ unsafe fn tray_icon(window: HWND, message: u32) -> bool {
         hIcon: LoadIconW(null_mut(), IDI_APPLICATION),
         ..Default::default()
     };
-    let label = format!("Snapshot ({})", config.label);
+    let label = format!(
+        "Snapshot ({})",
+        hotkey::current().get(hotkey::Binding::Capture).label()
+    );
     for (unit, value) in icon.szTip.iter_mut().take(127).zip(label.encode_utf16()) {
         *unit = value;
     }
@@ -169,14 +190,16 @@ unsafe fn tray_icon(window: HWND, message: u32) -> bool {
 }
 
 unsafe fn tray_menu(window: HWND) {
-    let config = CONFIG.get().expect("configuration initialized");
     let menu = CreatePopupMenu();
     if menu.is_null() {
         return;
     }
-    let capture = wide(&format!("截图 ({})", config.label));
+    let capture = wide(&format!(
+        "截图 ({})",
+        hotkey::current().get(hotkey::Binding::Capture).label()
+    ));
     AppendMenuW(menu, MF_STRING, MENU_CAPTURE, capture.as_ptr());
-    AppendMenuW(menu, MF_STRING, MENU_CONFIG, w!("编辑快捷键配置"));
+    AppendMenuW(menu, MF_STRING, MENU_CONFIG, w!("设置"));
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("退出"));
     let mut cursor = POINT::default();
@@ -196,8 +219,8 @@ unsafe fn tray_menu(window: HWND) {
     match command as usize {
         MENU_CAPTURE => begin_capture(window),
         MENU_CONFIG => {
-            if let Err(error) = Command::new("notepad.exe").arg(&config.path).spawn() {
-                show_error(window, &format!("无法打开配置。\n{error}"));
+            if let Err(error) = settings::open(window, GetModuleHandleW(null())) {
+                show_error(window, &format!("无法打开设置。\n{error}"));
             }
         }
         MENU_EXIT => {
@@ -208,10 +231,41 @@ unsafe fn tray_menu(window: HWND) {
 }
 
 unsafe fn begin_capture(window: HWND) {
+    if settings::is_open() {
+        return;
+    }
     let instance: HINSTANCE = GetModuleHandleW(null());
     if let Err(error) = selection::open(instance) {
         show_error(window, &format!("无法截取桌面。\n{error}"));
     }
+}
+
+unsafe fn apply_preferences(window: HWND, preferences: hotkey::Preferences) -> Result<(), String> {
+    let bindings = preferences.bindings.validate()?;
+    let capture = bindings.get(hotkey::Binding::Capture);
+    let previous = HOTKEY_ID.get();
+    let changed = capture != hotkey::current().get(hotkey::Binding::Capture);
+    let next = 3 - previous;
+    if changed && RegisterHotKey(window, next, capture.modifiers | MOD_NOREPEAT, capture.key) == 0 {
+        return Err(format!(
+            "无法注册 {}，它可能已被其他程序占用。",
+            capture.label()
+        ));
+    }
+    if let Err(error) = hotkey::save(preferences) {
+        if changed {
+            UnregisterHotKey(window, next);
+        }
+        return Err(error);
+    }
+    if changed {
+        UnregisterHotKey(window, previous);
+        HOTKEY_ID.set(next);
+    }
+    hotkey::activate(bindings);
+    pinned::set_opacity_step(preferences.opacity_step);
+    tray_icon(window, NIM_MODIFY);
+    Ok(())
 }
 
 unsafe fn show_error(window: HWND, message: &str) {

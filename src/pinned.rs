@@ -1,5 +1,10 @@
-use crate::capture::{Image, Surface};
+use crate::{
+    capture::{Image, Surface},
+    hotkey::DEFAULT_OPACITY_STEP,
+    toolbar::paint_size_badge,
+};
 use std::{
+    cell::Cell,
     io,
     ptr::{null, null_mut},
 };
@@ -15,13 +20,37 @@ use windows_sys::{
 
 const CLASS: *const u16 = w!("Snapshot.Pinned");
 const GLOW: i32 = 5;
+const BADGE_TIMER: usize = 1;
+const BADGE_DURATION_MS: u32 = 1200;
+const MIN_OPACITY: i32 = 15;
+const WHEEL_NOTCH: i32 = 120;
+
+thread_local! {
+    static OPACITY_STEP: Cell<u8> = const { Cell::new(DEFAULT_OPACITY_STEP) };
+}
+
+pub fn opacity_step() -> u8 {
+    OPACITY_STEP.get()
+}
+
+pub fn set_opacity_step(step: u8) {
+    OPACITY_STEP.set(step);
+}
+
+#[derive(Clone, Copy)]
+enum Badge {
+    Zoom,
+    Opacity,
+}
 
 struct Pin {
     surface: Surface,
     width: i32,
     height: i32,
     zoom: f64,
-    alpha: u8,
+    opacity: i32,
+    opacity_wheel_remainder: i32,
+    badge: Option<Badge>,
 }
 
 pub unsafe fn register(instance: HINSTANCE) -> io::Result<()> {
@@ -63,7 +92,9 @@ pub unsafe fn open(image: Image, bounds: RECT) -> io::Result<()> {
         width,
         height,
         zoom: 1.0,
-        alpha: 255,
+        opacity: 100,
+        opacity_wheel_remainder: 0,
+        badge: None,
     });
     SetWindowLongPtrW(window, GWLP_USERDATA, Box::into_raw(pin) as isize);
     if SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA) == 0 {
@@ -98,13 +129,24 @@ unsafe extern "system" fn window_proc(
             DestroyWindow(window);
         }
         WM_MOUSEWHEEL if !pin.is_null() => {
-            let steps = (wparam >> 16) as i16;
-            if wparam & 8 != 0 {
-                let alpha = (i32::from((*pin).alpha) + i32::from(steps) / 6).clamp(40, 255) as u8;
-                (*pin).alpha = alpha;
-                SetLayeredWindowAttributes(window, 0, alpha, LWA_ALPHA);
+            let delta = i32::from((wparam >> 16) as i16);
+            let badge = if wparam & 8 != 0 {
+                let pending = (*pin).opacity_wheel_remainder + delta;
+                (*pin).opacity_wheel_remainder = pending % WHEEL_NOTCH;
+                let notches = pending / WHEEL_NOTCH;
+                if notches == 0 {
+                    return 0;
+                }
+                let opacity =
+                    ((*pin).opacity + notches * i32::from(opacity_step())).clamp(MIN_OPACITY, 100);
+                let alpha = ((opacity * 255 + 50) / 100) as u8;
+                if SetLayeredWindowAttributes(window, 0, alpha, LWA_ALPHA) != 0 {
+                    (*pin).opacity = opacity;
+                }
+                Badge::Opacity
             } else {
-                let zoom = ((*pin).zoom * 1.15_f64.powf(f64::from(steps) / 120.0)).clamp(0.15, 4.0);
+                let zoom = ((*pin).zoom * 1.15_f64.powf(f64::from(delta) / f64::from(WHEEL_NOTCH)))
+                    .clamp(0.15, 4.0);
                 (*pin).zoom = zoom;
                 let width = (f64::from((*pin).width) * zoom).round().max(1.0) as i32 + 2 * GLOW;
                 let height = (f64::from((*pin).height) * zoom).round().max(1.0) as i32 + 2 * GLOW;
@@ -117,8 +159,17 @@ unsafe extern "system" fn window_proc(
                     height,
                     SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
                 );
-                InvalidateRect(window, null(), 0);
+                Badge::Zoom
+            };
+            if SetTimer(window, BADGE_TIMER, BADGE_DURATION_MS, None) != 0 {
+                (*pin).badge = Some(badge);
             }
+            InvalidateRect(window, null(), 0);
+        }
+        WM_TIMER if !pin.is_null() && wparam == BADGE_TIMER => {
+            KillTimer(window, BADGE_TIMER);
+            (*pin).badge = None;
+            InvalidateRect(window, null(), 0);
         }
         WM_PAINT if !pin.is_null() => {
             let mut paint = PAINTSTRUCT::default();
@@ -152,9 +203,39 @@ unsafe extern "system" fn window_proc(
                 (*pin).height,
                 SRCCOPY,
             );
+            if let Some(badge) = (*pin).badge {
+                paint_badge(dc, bounds, &*pin, badge);
+            }
             EndPaint(window, &paint);
         }
         _ => return DefWindowProcW(window, message, wparam, lparam),
     }
     0
+}
+
+unsafe fn paint_badge(dc: HDC, image: RECT, pin: &Pin, badge: Badge) {
+    const WIDTH: i32 = 110;
+    const HEIGHT: i32 = 24;
+
+    let width = image.right - image.left;
+    if width < 44 || image.bottom - image.top < HEIGHT {
+        return;
+    }
+    let (name, percent) = match badge {
+        Badge::Zoom => ("大小", (pin.zoom * 100.0).round() as i32),
+        Badge::Opacity => ("不透明度", pin.opacity),
+    };
+    let text = if width >= WIDTH {
+        format!("{name} {percent}%")
+    } else {
+        format!("{percent}%")
+    };
+    let label: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    let bounds = RECT {
+        left: image.left,
+        top: image.top,
+        right: image.left + width.min(WIDTH),
+        bottom: image.top + HEIGHT,
+    };
+    paint_size_badge(dc, bounds, label.as_ptr());
 }

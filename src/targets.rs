@@ -1,5 +1,7 @@
 use std::{
+    cell::OnceCell,
     collections::HashSet,
+    ptr::null_mut,
     sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -8,21 +10,31 @@ use windows::{
     core::Interface,
     Win32::{
         Foundation::HWND as AutomationHwnd,
-        System::Com::{
-            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-            COINIT_MULTITHREADED,
+        System::{
+            Com::{
+                CoCreateInstance, CoInitializeEx, CoUninitialize, IDispatch, CLSCTX_INPROC_SERVER,
+                COINIT_MULTITHREADED,
+            },
+            Variant::{VARIANT, VT_DISPATCH, VT_I4},
         },
         UI::Accessibility::{
-            CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest,
-            IUIAutomationCondition, TreeScope_Children, UIA_BoundingRectanglePropertyId,
-            UIA_ControlTypePropertyId, UIA_IsOffscreenPropertyId, UIA_TextControlTypeId,
+            AccessibleObjectFromWindow, CUIAutomation8, IAccessible, IUIAutomation, IUIAutomation2,
+            IUIAutomationCacheRequest, IUIAutomationCondition, TreeScope_Children,
+            UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_IsOffscreenPropertyId,
+            UIA_TextControlTypeId,
         },
     },
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, POINT, RECT},
-    Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS},
-    UI::WindowsAndMessaging::*,
+    Graphics::{
+        Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS},
+        Gdi::ScreenToClient,
+    },
+    UI::{
+        Controls::{STATE_SYSTEM_INVISIBLE, STATE_SYSTEM_OFFSCREEN},
+        WindowsAndMessaging::*,
+    },
 };
 
 use crate::selection_geometry::{contains, intersect};
@@ -124,7 +136,8 @@ impl ElementProbe {
                 if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
                     return;
                 }
-                if let Ok(automation) = Automation::new() {
+                {
+                    let automation = OnceCell::new();
                     let mut seen = HashSet::new();
                     let mut retry = None;
                     loop {
@@ -142,7 +155,7 @@ impl ElementProbe {
                         let Some(request) = request else {
                             continue;
                         };
-                        let region = automation.find(request).ok().flatten();
+                        let region = find_element(request, &automation);
                         // Browsers can expose their web accessibility tree after the first query.
                         if seen.insert(request.window.id) && region.is_none_or(|region| region.weak)
                         {
@@ -172,6 +185,144 @@ impl ElementProbe {
     pub fn latest(&self) -> Option<ElementMatch> {
         self.results.try_iter().last()
     }
+}
+
+unsafe fn find_element(
+    request: Request,
+    automation: &OnceCell<Option<Automation>>,
+) -> Option<ElementRegion> {
+    let window = request.window.id as HWND;
+    if IsHungAppWindow(window) != 0 {
+        return None;
+    }
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let child = child_at(request);
+    let mut hit =
+        child.and_then(|(handle, bounds)| msaa_at(handle, bounds, request.point, deadline));
+    if hit.is_none_or(|rect| area(rect) * 10 >= area(request.window.rect) * 9)
+        && Instant::now() < deadline
+    {
+        hit = msaa_at(window, request.window.rect, request.point, deadline).or(hit);
+    }
+    let region = hit.map(|rect| ElementRegion {
+        rect,
+        weak: area(rect) * 10 >= area(request.window.rect) * 9,
+    });
+    if region.is_some_and(|region| !region.weak) {
+        return region;
+    }
+    let uia = automation
+        .get_or_init(|| Automation::new().ok())
+        .as_ref()
+        .and_then(|automation| automation.find(request).ok().flatten());
+    uia.filter(|region| !region.weak)
+        .or_else(|| child.map(|(_, rect)| ElementRegion { rect, weak: true }))
+        .or(uia)
+        .or(region)
+}
+
+unsafe fn child_at(request: Request) -> Option<(HWND, RECT)> {
+    let root = request.window.id as HWND;
+    let mut parent = root;
+    let mut bounds = request.window.rect;
+    for _ in 0..32 {
+        let mut point = request.point;
+        if ScreenToClient(parent, &mut point) == 0 {
+            break;
+        }
+        let child = ChildWindowFromPointEx(parent, point, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT);
+        if child.is_null() || child == parent {
+            break;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(child, &mut rect) == 0 {
+            break;
+        }
+        let Some(clipped) = intersect(rect, bounds).filter(|rect| contains(*rect, request.point))
+        else {
+            break;
+        };
+        parent = child;
+        bounds = clipped;
+    }
+    (parent != root).then_some((parent, bounds))
+}
+
+unsafe fn msaa_at(window: HWND, bounds: RECT, point: POINT, deadline: Instant) -> Option<RECT> {
+    let mut raw = null_mut();
+    AccessibleObjectFromWindow(
+        AutomationHwnd(window),
+        OBJID_WINDOW as u32,
+        &IAccessible::IID,
+        &mut raw,
+    )
+    .ok()?;
+    if raw.is_null() {
+        return None;
+    }
+    let mut object = IAccessible::from_raw(raw);
+    let self_id = VARIANT::from(CHILDID_SELF as i32);
+    let mut clip = bounds;
+    let mut best = None;
+    for _ in 0..60 {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Ok(hit) = object.accHitTest(point.x, point.y) else {
+            break;
+        };
+        let next = match hit.vt() {
+            VT_DISPATCH => IDispatch::try_from(&hit)
+                .and_then(|dispatch| dispatch.cast::<IAccessible>())
+                .ok(),
+            VT_I4 => {
+                if let Some(rect) = accessible_bounds(&object, &hit, clip, point) {
+                    best = Some(rect);
+                }
+                break;
+            }
+            _ => break,
+        };
+        let Some(next) = next.filter(|next| *next != object) else {
+            break;
+        };
+        if let Some(rect) = accessible_bounds(&next, &self_id, clip, point) {
+            clip = rect;
+            best = Some(rect);
+        }
+        object = next;
+    }
+    best
+}
+
+unsafe fn accessible_bounds(
+    object: &IAccessible,
+    child: &VARIANT,
+    clip: RECT,
+    point: POINT,
+) -> Option<RECT> {
+    let state = object
+        .get_accState(child)
+        .ok()
+        .filter(|state| state.vt() == VT_I4)
+        .and_then(|state| u32::try_from(&state).ok());
+    if state.is_some_and(|state| state & (STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_OFFSCREEN) != 0) {
+        return None;
+    }
+    let (mut left, mut top, mut width, mut height) = (0, 0, 0, 0);
+    object
+        .accLocation(&mut left, &mut top, &mut width, &mut height, child)
+        .ok()?;
+    intersect(
+        clip,
+        RECT {
+            left,
+            top,
+            right: left.checked_add(width)?,
+            bottom: top.checked_add(height)?,
+        },
+    )
+    .filter(|rect| contains(*rect, point))
 }
 
 struct Automation {

@@ -7,13 +7,23 @@ use windows_sys::{
     },
 };
 
-use crate::{annotation::Tool, capture::Surface, selection_geometry::intersect};
+use crate::{
+    annotation::Tool,
+    capture::Surface,
+    hotkey::{self, Binding},
+    icons::{self, Icon},
+    selection_geometry::intersect,
+    typography::{self, TextStyle},
+};
 
-const PANEL_WIDTH: i32 = 272;
-const ROW_HEIGHT: i32 = 23;
-const PANEL_INSET: i32 = 10;
+const PANEL_WIDTH: i32 = 360;
+const ROW_HEIGHT: i32 = 25;
+const PANEL_INSET: i32 = 8;
 const PANEL_HEIGHT: i32 = 5 * ROW_HEIGHT + 2 * PANEL_INSET;
-const PANEL_MARGIN: i32 = 16;
+const PANEL_MARGIN: i32 = 12;
+const KEYCAP_HEIGHT: i32 = 18;
+const KEYCAP_GAP: i32 = 3;
+const COLUMN_GAP: i32 = 11;
 const ZOOM: i32 = 5;
 const SAMPLE_WIDTH: i32 = 33;
 const SAMPLE_HEIGHT: i32 = 25;
@@ -34,6 +44,7 @@ pub unsafe fn monitor_info(cursor: POINT) -> Option<MONITORINFO> {
 pub struct HintPanel {
     pub bounds: RECT,
     surface: Surface,
+    max_width: i32,
     max_height: i32,
     bottom: i32,
     mode: Option<HintMode>,
@@ -48,75 +59,177 @@ pub enum HintMode {
 }
 
 impl HintMode {
-    fn rows(self) -> &'static [(*const u16, *const u16)] {
+    fn rows(self) -> &'static [HintRow] {
+        use HintInput::{Bound, Key, Mouse};
         match self {
             Self::Automatic => {
                 const {
                     &[
-                        (w!("左键"), w!("锁定自动选区")),
-                        (w!("左键拖动"), w!("手动框选")),
-                        (w!("Esc"), w!("退出截图")),
+                        (Mouse(Icon::MouseLeft), w!("锁定自动选区")),
+                        (Mouse(Icon::Drag), w!("手动拖出选区")),
+                        (
+                            HintInput::MouseOrKey(Icon::MouseRight, "Esc"),
+                            w!("退出截图"),
+                        ),
                     ]
                 }
             }
             Self::Selected => {
                 const {
                     &[
-                        (w!("框内拖动"), w!("移动选区")),
-                        (w!("边线拖动"), w!("调整选区大小")),
-                        (w!("右键"), w!("返回自动框选")),
-                        (w!("Ctrl+C"), w!("复制截图")),
-                        (w!("Esc"), w!("退出截图")),
+                        (Mouse(Icon::Move), w!("拖动框内移动")),
+                        (Mouse(Icon::Resize), w!("拖动边线缩放")),
+                        (Mouse(Icon::MouseRight), w!("返回自动框选")),
+                        (Bound(Binding::Copy), w!("复制截图")),
+                        (Key("Esc"), w!("退出截图")),
                     ]
                 }
             }
             Self::Annotate(Tool::Rectangle) => {
                 const {
                     &[
-                        (w!("左键拖动"), w!("绘制矩形")),
-                        (w!("Ctrl+1"), w!("退出矩形工具")),
-                        (w!("Ctrl+5"), w!("撤回标注")),
+                        (Mouse(Icon::Drag), w!("绘制矩形")),
+                        (Bound(Binding::Rectangle), w!("退出矩形工具")),
+                        (Bound(Binding::Undo), w!("撤回标注")),
                     ]
                 }
             }
             Self::Annotate(Tool::Text) => {
                 const {
                     &[
-                        (w!("左键"), w!("插入文本框")),
-                        (w!("左键拖动"), w!("指定文本框大小")),
-                        (w!("Ctrl+2"), w!("退出文本工具")),
+                        (Mouse(Icon::MouseLeft), w!("插入文本框")),
+                        (Mouse(Icon::Drag), w!("指定文本框大小")),
+                        (Bound(Binding::Text), w!("退出文本工具")),
                     ]
                 }
             }
             Self::Annotate(Tool::Brush) => {
                 const {
                     &[
-                        (w!("左键拖动"), w!("自由绘制")),
-                        (w!("Ctrl+3"), w!("退出画笔工具")),
-                        (w!("Ctrl+5"), w!("撤回标注")),
+                        (Mouse(Icon::Drag), w!("自由绘制")),
+                        (Bound(Binding::Brush), w!("退出画笔工具")),
+                        (Bound(Binding::Undo), w!("撤回标注")),
                     ]
                 }
             }
             Self::Annotate(Tool::Mosaic) => {
                 const {
                     &[
-                        (w!("左键拖动"), w!("框选马赛克范围")),
-                        (w!("Ctrl+4"), w!("退出马赛克工具")),
-                        (w!("Ctrl+5"), w!("撤回标注")),
+                        (Mouse(Icon::Drag), w!("框选马赛克范围")),
+                        (Bound(Binding::Mosaic), w!("退出马赛克工具")),
+                        (Bound(Binding::Undo), w!("撤回标注")),
                     ]
                 }
             }
             Self::EditText => {
                 const {
                     &[
-                        (w!("Enter"), w!("换行")),
-                        (w!("Ctrl+Enter"), w!("确认文本")),
-                        (w!("Esc"), w!("取消文本输入")),
+                        (Key("Enter"), w!("换行")),
+                        (Key("Ctrl+Enter"), w!("确认文本")),
+                        (Key("Esc"), w!("取消文本输入")),
                     ]
                 }
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum HintInput {
+    Mouse(Icon),
+    MouseOrKey(Icon, &'static str),
+    Key(&'static str),
+    Bound(Binding),
+}
+
+type HintRow = (HintInput, *const u16);
+
+enum Keycap {
+    Mouse(Icon),
+    Text(Vec<u16>),
+    Separator,
+}
+
+impl HintInput {
+    fn keycaps(self, bindings: hotkey::Bindings) -> Vec<Keycap> {
+        let label;
+        let chord = match self {
+            Self::Mouse(icon) => return vec![Keycap::Mouse(icon)],
+            Self::MouseOrKey(icon, key) => {
+                return vec![
+                    Keycap::Mouse(icon),
+                    Keycap::Separator,
+                    Keycap::Text(crate::wide(key)),
+                ];
+            }
+            Self::Key(chord) => chord,
+            Self::Bound(binding) => {
+                label = bindings.get(binding).label();
+                &label
+            }
+        };
+        chord
+            .split('+')
+            .map(|part| Keycap::Text(crate::wide(part)))
+            .collect()
+    }
+}
+
+impl Keycap {
+    unsafe fn width(&self, dc: HDC) -> i32 {
+        match self {
+            Self::Mouse(_) => KEYCAP_HEIGHT,
+            Self::Text(text) => (text_width(dc, text.as_ptr()) + 8).max(KEYCAP_HEIGHT),
+            Self::Separator => 6,
+        }
+    }
+
+    unsafe fn paint(&self, dc: HDC, rect: RECT) {
+        if !matches!(self, Self::Separator) {
+            SetDCBrushColor(dc, 0x00b0_b0b0);
+            FrameRect(dc, &rect, GetStockObject(DC_BRUSH));
+        }
+        match self {
+            Self::Mouse(icon) => icons::paint(
+                dc,
+                RECT {
+                    left: rect.left + 3,
+                    top: rect.top + 2,
+                    right: rect.right - 3,
+                    bottom: rect.bottom - 2,
+                },
+                *icon,
+                0x00ff_ffff,
+            ),
+            Self::Text(_) | Self::Separator => {
+                let mut text_rect = rect;
+                SetTextColor(dc, 0x00ff_ffff);
+                let label = match self {
+                    Self::Text(text) => text.as_ptr(),
+                    _ => w!("/"),
+                };
+                DrawTextW(
+                    dc,
+                    label,
+                    -1,
+                    &mut text_rect,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+            }
+        }
+    }
+}
+
+unsafe fn text_width(dc: HDC, text: *const u16) -> i32 {
+    let mut bounds = RECT::default();
+    DrawTextW(
+        dc,
+        text,
+        -1,
+        &mut bounds,
+        DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX,
+    );
+    bounds.right
 }
 
 impl HintPanel {
@@ -134,6 +247,7 @@ impl HintPanel {
                 bottom,
             },
             surface,
+            max_width: width,
             max_height,
             bottom,
             mode: None,
@@ -151,17 +265,49 @@ impl HintPanel {
         let rows = mode.rows();
         let height = (rows.len() as i32 * ROW_HEIGHT + 2 * PANEL_INSET).min(self.max_height);
         self.bounds.top = self.bottom - height;
-        let width = self.bounds.right - self.bounds.left;
         let surface = &self.surface;
+        let description_font = typography::font(TextStyle::HintDescription);
+        let key_font = typography::font(TextStyle::Ui);
+        let previous_font = SelectObject(surface.dc, description_font);
+        let description_column = rows
+            .iter()
+            .map(|&(_, description)| text_width(surface.dc, description))
+            .max()
+            .unwrap_or_default();
+        SelectObject(surface.dc, key_font);
+        let bindings = hotkey::current();
+        let mut key_column = 0;
+        let lines: Vec<_> = rows
+            .iter()
+            .map(|&(input, description)| {
+                let caps: Vec<_> = input
+                    .keycaps(bindings)
+                    .into_iter()
+                    .map(|cap| {
+                        let width = cap.width(surface.dc);
+                        (cap, width)
+                    })
+                    .collect();
+                let cap_width = caps
+                    .iter()
+                    .map(|(_, width)| width + KEYCAP_GAP)
+                    .sum::<i32>()
+                    - KEYCAP_GAP;
+                key_column = key_column.max(cap_width);
+                (caps, cap_width, description)
+            })
+            .collect();
+        let width =
+            (2 * PANEL_INSET + key_column + COLUMN_GAP + description_column).min(self.max_width);
+        self.bounds.right = self.bounds.left + width;
         let panel = RECT {
             right: width,
             bottom: height,
             ..Default::default()
         };
-        let brush = GetStockObject(DC_BRUSH);
         FillRect(surface.dc, &panel, GetStockObject(BLACK_BRUSH));
         let blend = BLENDFUNCTION {
-            SourceConstantAlpha: 26,
+            SourceConstantAlpha: 51,
             ..Default::default()
         };
         AlphaBlend(
@@ -177,75 +323,47 @@ impl HintPanel {
             height,
             blend,
         );
-        SetDCBrushColor(surface.dc, 0x0060_6060);
+        let brush = GetStockObject(DC_BRUSH);
+        SetDCBrushColor(surface.dc, 0x0057_5757);
         FrameRect(surface.dc, &panel, brush);
         SetBkMode(surface.dc, TRANSPARENT as i32);
-        let font = CreateFontW(
-            -16,
-            0,
-            0,
-            0,
-            FW_NORMAL as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            OUT_DEFAULT_PRECIS as u32,
-            CLIP_DEFAULT_PRECIS as u32,
-            ANTIALIASED_QUALITY as u32,
-            DEFAULT_PITCH as u32,
-            w!("Microsoft YaHei UI"),
-        );
-        let selected_font = if font.is_null() {
-            GetStockObject(DEFAULT_GUI_FONT)
-        } else {
-            font
-        };
-        let previous_font = SelectObject(surface.dc, selected_font);
-        let split = (width * 2 / 5).min(126);
-        for (index, &(key, description)) in rows.iter().enumerate() {
+        let split = (PANEL_INSET + key_column).min(width.saturating_sub(2 * PANEL_INSET));
+        for (index, (caps, cap_width, description)) in lines.into_iter().enumerate() {
             let top = PANEL_INSET + index as i32 * ROW_HEIGHT;
-            let mut size = RECT::default();
-            DrawTextW(surface.dc, key, -1, &mut size, DT_SINGLELINE | DT_CALCRECT);
-            let mut badge = RECT {
-                left: (split - size.right - 14).max(6),
-                top: top + 2,
-                right: split,
-                bottom: top + ROW_HEIGHT - 2,
-            };
-            SetDCBrushColor(surface.dc, 0x0036_3636);
-            FillRect(surface.dc, &badge, brush);
-            SetDCBrushColor(surface.dc, 0x0078_7878);
-            FrameRect(surface.dc, &badge, brush);
-            badge.left += 3;
-            badge.right -= 7;
-            SetTextColor(surface.dc, 0x00ff_ffff);
-            DrawTextW(
-                surface.dc,
-                key,
-                -1,
-                &mut badge,
-                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-            );
+            let cap_top = top + (ROW_HEIGHT - KEYCAP_HEIGHT) / 2;
+            let mut x = split - cap_width;
+            for (cap, width) in caps {
+                if x >= PANEL_INSET {
+                    cap.paint(
+                        surface.dc,
+                        RECT {
+                            left: x,
+                            top: cap_top,
+                            right: x + width,
+                            bottom: cap_top + KEYCAP_HEIGHT,
+                        },
+                    );
+                }
+                x += width + KEYCAP_GAP;
+            }
             let mut detail = RECT {
-                left: split + 11,
+                left: split + COLUMN_GAP,
                 top,
-                right: width - 10,
+                right: width - PANEL_INSET,
                 bottom: top + ROW_HEIGHT,
             };
-            SetTextColor(surface.dc, 0x00df_dfdf);
+            SelectObject(surface.dc, description_font);
+            SetTextColor(surface.dc, 0x00f4_f4f4);
             DrawTextW(
                 surface.dc,
                 description,
                 -1,
                 &mut detail,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
             );
+            SelectObject(surface.dc, key_font);
         }
         SelectObject(surface.dc, previous_font);
-        if !font.is_null() {
-            DeleteObject(font);
-        }
         Some([previous, self.bounds])
     }
 
@@ -411,6 +529,18 @@ mod tests {
             let [_, text] = hint.set_mode(source.dc, HintMode::EditText).unwrap();
             assert_eq!(text.top, automatic.top);
             assert_eq!(text.bottom, automatic.bottom);
+            let mut custom = hotkey::DEFAULT;
+            custom.set(
+                Binding::Copy,
+                hotkey::Shortcut::parse("Ctrl+Alt+Shift+F10").unwrap(),
+            );
+            hotkey::activate(custom);
+            let [_, wider] = hint.set_mode(source.dc, HintMode::Selected).unwrap();
+            hotkey::activate(hotkey::DEFAULT);
+            assert_eq!(wider.left, selected.left);
+            assert_eq!(wider.bottom, selected.bottom);
+            assert!(wider.right > selected.right);
+            assert!(wider.right <= area.right);
         }
     }
 
