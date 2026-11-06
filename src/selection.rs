@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::RefCell,
     io,
     mem::size_of,
@@ -81,6 +82,7 @@ struct TextDrag {
     anchor: POINT,
     handle: TextHandle,
     original: TextMark,
+    frame: Option<TextMark>,
 }
 
 struct Editor {
@@ -89,6 +91,16 @@ struct Editor {
     background: HBRUSH,
     index: Option<usize>,
     text: TextMark,
+}
+
+impl Editor {
+    fn frame(&self) -> Cow<'_, TextMark> {
+        if self.text.is_rotated() {
+            Cow::Borrowed(&self.text)
+        } else {
+            Cow::Owned(TextMark::new(self.rect, self.text.size, self.text.color))
+        }
+    }
 }
 
 impl Drop for Editor {
@@ -105,11 +117,15 @@ impl Selection {
             .and_then(|index| self.annotations.text(index))
     }
 
-    fn text_frame(&self) -> Option<&TextMark> {
-        self.editor
-            .as_ref()
-            .map(|editor| &editor.text)
-            .or_else(|| self.selected_text())
+    fn text_frame(&self) -> Option<Cow<'_, TextMark>> {
+        if let Some(editor) = &self.editor {
+            return Some(if self.text_drag.is_some() {
+                Cow::Borrowed(&editor.text)
+            } else {
+                editor.frame()
+            });
+        }
+        self.selected_text().map(Cow::Borrowed)
     }
 
     fn option_style(&self) -> Style {
@@ -303,6 +319,13 @@ unsafe extern "system" fn window_proc(
             if begin_editor_drag(window, point) {
                 return 0;
             }
+            if let Some(editor) = SESSION.with_borrow(|session| {
+                let editor = session.as_ref()?.editor.as_ref()?;
+                editor.frame().contains(point).then_some(editor.window)
+            }) {
+                SetFocus(editor);
+                return 0;
+            }
             finish_text(window, true);
             if begin_text_drag(window, point, message == WM_LBUTTONDBLCLK) {
                 hide_loupe(window);
@@ -390,7 +413,7 @@ unsafe extern "system" fn window_proc(
             }) {
                 SetTextColor(wparam as HDC, color);
                 SetBkMode(wparam as HDC, TRANSPARENT as i32);
-                SetBrushOrgEx(wparam as HDC, -1, -1, null_mut());
+                SetBrushOrgEx(wparam as HDC, 0, 0, null_mut());
                 return brush as LRESULT;
             }
             return DefWindowProcW(window, message, wparam, lparam);
@@ -514,10 +537,36 @@ unsafe fn refresh_options(window: HWND) {
     let changed = SESSION.with_borrow_mut(|session| {
         let selection = session.as_mut()?;
         let previous = selection.options.take();
+        let rotating = selection
+            .text_drag
+            .as_ref()
+            .is_some_and(|drag| matches!(drag.handle, TextHandle::Rotate));
         selection.options = selection
             .toolbar
+            .filter(|_| !rotating)
             .zip(selection.annotations.tool)
-            .and_then(|(toolbar, tool)| toolbar.options(tool, selection.rect));
+            .and_then(|(toolbar, tool)| {
+                let options = toolbar.options(tool, selection.rect)?;
+                if tool == Tool::Text {
+                    if let Some(frame) = selection.text_frame() {
+                        let frame = frame.bounds();
+                        let desktop = selection.desktop.bounds;
+                        let point = POINT {
+                            x: frame.left + (frame.right - frame.left) / 2 + desktop.left,
+                            y: frame.top + (frame.bottom - frame.top) / 2 + desktop.top,
+                        };
+                        let area = monitor_info(point)
+                            .and_then(|info| overlay_rect(info.rcMonitor, desktop))
+                            .unwrap_or(selection.canvas);
+                        return Some(
+                            options
+                                .near_text(frame, toolbar.bounds, area)
+                                .unwrap_or(options),
+                        );
+                    }
+                }
+                Some(options)
+            });
         selection.options_hover = None;
         let tip = selection
             .toolbar
@@ -578,8 +627,9 @@ unsafe fn change_option(window: HWND, choice: Choice) {
             editor.text = text;
             let resized = layout.map(|background| {
                 DeleteObject(std::mem::replace(&mut editor.background, background));
-                dirty[0] = Some(editor.rect);
+                dirty[0] = Some(editor.frame().bounds());
                 editor.rect = rect;
+                dirty[1] = Some(editor.frame().bounds());
                 rect
             });
             editor_font = Some((
@@ -608,16 +658,7 @@ unsafe fn change_option(window: HWND, choice: Choice) {
         if let Some((editor, font, resized)) = editor_font {
             SendMessageW(editor, WM_SETFONT, font as usize, 0);
             if let Some(rect) = resized {
-                SetWindowPos(
-                    editor,
-                    null_mut(),
-                    rect.left,
-                    rect.top,
-                    rect.right - rect.left,
-                    rect.bottom - rect.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                set_editor_format(editor, rect);
+                position_editor(editor, rect);
             }
             InvalidateRect(editor, null(), 1);
             SetFocus(editor);
@@ -625,6 +666,7 @@ unsafe fn change_option(window: HWND, choice: Choice) {
         if let Some(options) = options {
             InvalidateRect(window, &options.bounds, 0);
         }
+        refresh_options(window);
         invalidate_toolbar(window);
         update_cursor_at_pointer(window);
     }
@@ -854,6 +896,7 @@ unsafe fn begin_text_drag(window: HWND, point: POINT, double: bool) -> bool {
                 anchor: point,
                 handle,
                 original: text,
+                frame: None,
             });
             Some((previous, bounds, None))
         }
@@ -879,13 +922,15 @@ unsafe fn begin_text_drag(window: HWND, point: POINT, double: bool) -> bool {
 unsafe fn begin_editor_drag(window: HWND, point: POINT) -> bool {
     let target = SESSION.with_borrow(|session| {
         let editor = session.as_ref()?.editor.as_ref()?;
-        Some((editor.window, editor.text.hit_chrome(point)?))
+        let frame = editor.frame();
+        Some((editor.window, frame.hit_chrome(point)?, frame.into_owned()))
     });
-    let Some((editor, handle)) = target else {
+    let Some((editor, handle, frame)) = target else {
         return false;
     };
+    let bounds = frame.bounds();
     let value = read_editor_text(editor);
-    let bounds = SESSION.with_borrow_mut(|session| {
+    SESSION.with_borrow_mut(|session| {
         let selection = session.as_mut().unwrap();
         let editor = selection.editor.as_mut().unwrap();
         editor.text.text = value;
@@ -907,13 +952,14 @@ unsafe fn begin_editor_drag(window: HWND, point: POINT) -> bool {
             anchor: point,
             handle,
             original: editor.text.clone(),
+            frame: Some(frame),
         });
-        editor.rect
     });
     SetCapture(window);
     ShowWindow(editor, SW_HIDE);
     SetFocus(window);
     InvalidateRect(window, &bounds, 0);
+    refresh_options(window);
     SetCursor(LoadCursorW(null_mut(), text_handle_cursor(handle)));
     true
 }
@@ -932,9 +978,15 @@ unsafe fn update_text_drag(window: HWND, point: POINT, end: bool) -> bool {
             x: point.x.clamp(limit.left, limit.right - 1),
             y: point.y.clamp(limit.top, limit.bottom - 1),
         };
-        let mut next = drag
-            .original
-            .transform_drag(drag.handle, drag.anchor, point);
+        let mut next = match &drag.frame {
+            Some(frame) => {
+                drag.original
+                    .transform_drag_from(frame, drag.handle, drag.anchor, point)
+            }
+            None => drag
+                .original
+                .transform_drag(drag.handle, drag.anchor, point),
+        };
         if matches!(drag.handle, TextHandle::Scale(_, _)) && next.size != drag.original.size {
             next.fit_text(selection.desktop.surface.dc);
         }
@@ -972,9 +1024,7 @@ unsafe fn update_text_drag(window: HWND, point: POINT, end: bool) -> bool {
                 update_cursor(point);
             }
         }
-        if let Some(options) = SESSION.with_borrow(|session| session.as_ref()?.options) {
-            InvalidateRect(window, &options.bounds, 0);
-        }
+        refresh_options(window);
     }
     changed.is_some()
 }
@@ -1047,15 +1097,16 @@ unsafe fn open_text(window: HWND, index: Option<usize>, text: TextMark) {
         }
     };
     let content: Vec<u16> = text.text.iter().copied().chain([0]).collect();
+    let input = editor_input_rect(rect);
     let editor = CreateWindowExW(
         0,
         w!("EDIT"),
         content.as_ptr(),
-        WS_CHILD | WS_BORDER | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32,
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
+        WS_CHILD | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32,
+        input.left,
+        input.top,
+        input.right - input.left,
+        input.bottom - input.top,
         window,
         null_mut(),
         GetModuleHandleW(null()),
@@ -1072,6 +1123,11 @@ unsafe fn open_text(window: HWND, index: Option<usize>, text: TextMark) {
     }
     let font = typography::annotation_font(text.size);
     let bounds = text.bounds();
+    let frame = if text.is_rotated() {
+        bounds
+    } else {
+        TextMark::new(rect, text.size, text.color).bounds()
+    };
     SESSION.with_borrow_mut(|session| {
         session.as_mut().unwrap().editor = Some(Editor {
             window: editor,
@@ -1082,11 +1138,12 @@ unsafe fn open_text(window: HWND, index: Option<usize>, text: TextMark) {
         });
     });
     SendMessageW(editor, WM_SETFONT, font as usize, 0);
-    set_editor_format(editor, rect);
+    set_editor_format(editor, input);
     ShowWindow(editor, SW_SHOW);
     SetFocus(editor);
     SetCursor(LoadCursorW(null_mut(), IDC_IBEAM));
     InvalidateRect(window, &bounds, 0);
+    InvalidateRect(window, &frame, 0);
     refresh_options(window);
     refresh_hint(window);
 }
@@ -1098,14 +1155,20 @@ unsafe fn resume_editor(window: HWND) {
         let rect = text_editor_bounds(selection, &editor.text);
         let background = text_editor_background(selection, rect, editor.index).ok();
         let editor = selection.editor.as_mut().unwrap();
-        let previous = editor.rect;
+        let previous = editor.frame().bounds();
         if let Some(background) = background {
             DeleteObject(std::mem::replace(&mut editor.background, background));
             editor.rect = rect;
         }
-        Some((editor.window, editor.rect, previous, editor.text.size))
+        Some((
+            editor.window,
+            editor.rect,
+            previous,
+            editor.frame().bounds(),
+            editor.text.size,
+        ))
     });
-    let Some((editor, rect, previous, size)) = layout else {
+    let Some((editor, rect, previous, current, size)) = layout else {
         return;
     };
     SendMessageW(
@@ -1114,6 +1177,27 @@ unsafe fn resume_editor(window: HWND) {
         typography::annotation_font(size) as usize,
         0,
     );
+    position_editor(editor, rect);
+    ShowWindow(editor, SW_SHOW);
+    SetFocus(editor);
+    InvalidateRect(editor, null(), 1);
+    InvalidateRect(window, &previous, 0);
+    InvalidateRect(window, &current, 0);
+    update_cursor_at_pointer(window);
+}
+
+fn editor_input_rect(mut frame: RECT) -> RECT {
+    let inset_x = ((frame.right - frame.left - 1) / 2).min(2);
+    let inset_y = ((frame.bottom - frame.top - 1) / 2).min(2);
+    frame.left += inset_x;
+    frame.top += inset_y;
+    frame.right -= inset_x;
+    frame.bottom -= inset_y;
+    frame
+}
+
+unsafe fn position_editor(editor: HWND, frame: RECT) {
+    let rect = editor_input_rect(frame);
     SetWindowPos(
         editor,
         null_mut(),
@@ -1124,19 +1208,14 @@ unsafe fn resume_editor(window: HWND) {
         SWP_NOZORDER | SWP_NOACTIVATE,
     );
     set_editor_format(editor, rect);
-    ShowWindow(editor, SW_SHOW);
-    SetFocus(editor);
-    InvalidateRect(editor, null(), 1);
-    InvalidateRect(window, &previous, 0);
-    update_cursor_at_pointer(window);
 }
 
 unsafe fn set_editor_format(editor: HWND, rect: RECT) {
     let format_rect = RECT {
-        left: 2,
-        top: 2,
-        right: (rect.right - rect.left - 4).max(3),
-        bottom: (rect.bottom - rect.top - 4).max(3),
+        left: 1,
+        top: 1,
+        right: (rect.right - rect.left - 1).max(2),
+        bottom: (rect.bottom - rect.top - 1).max(2),
     };
     SendMessageW(editor, EM_SETRECT, 0, &format_rect as *const RECT as LPARAM);
 }
@@ -1146,11 +1225,13 @@ unsafe fn text_editor_background(
     rect: RECT,
     index: Option<usize>,
 ) -> io::Result<HBRUSH> {
-    let image = selection.desktop.composite_crop(rect, |dc| {
-        selection
-            .annotations
-            .paint(dc, selection.rect, false, index);
-    })?;
+    let image = selection
+        .desktop
+        .composite_crop(editor_input_rect(rect), |dc| {
+            selection
+                .annotations
+                .paint(dc, selection.rect, false, index);
+        })?;
     let (surface, _, _) = image.into_surface()?;
     let brush = CreatePatternBrush(surface.bitmap());
     if brush.is_null() {
@@ -1162,29 +1243,18 @@ unsafe fn text_editor_background(
 fn text_editor_bounds(selection: &Selection, text: &TextMark) -> RECT {
     let clip = selection.rect;
     let mut rect = text.edit_rect(clip);
-    let panels = [
-        selection.toolbar.map(|toolbar| toolbar.bounds),
-        selection.options.map(|options| options.bounds),
-    ];
-    if !panels
-        .into_iter()
-        .flatten()
-        .any(|bounds| intersect(bounds, rect).is_some())
-    {
+    if text.is_rotated() {
         return rect;
     }
-    let top = panels
-        .into_iter()
-        .flatten()
-        .map(|bounds| bounds.top)
-        .min()
-        .unwrap();
-    let bottom = panels
-        .into_iter()
-        .flatten()
-        .map(|bounds| bounds.bottom)
-        .max()
-        .unwrap();
+    let Some(toolbar) = selection
+        .toolbar
+        .map(|toolbar| toolbar.bounds)
+        .filter(|bounds| intersect(*bounds, rect).is_some())
+    else {
+        return rect;
+    };
+    let top = toolbar.top;
+    let bottom = toolbar.bottom;
     let above = top - clip.top - 2;
     let below = clip.bottom - bottom - 2;
     let height = rect.bottom - rect.top;
@@ -1210,7 +1280,8 @@ unsafe extern "system" fn text_proc(
     if message == WM_SETCURSOR {
         let mut point = POINT::default();
         let handle = if GetCursorPos(&mut point) != 0 && ScreenToClient(parent, &mut point) != 0 {
-            SESSION.with_borrow(|session| session.as_ref()?.editor.as_ref()?.text.hit_chrome(point))
+            SESSION
+                .with_borrow(|session| session.as_ref()?.editor.as_ref()?.frame().hit_chrome(point))
         } else {
             None
         };
@@ -1296,9 +1367,13 @@ unsafe fn finish_text(window: HWND, save: bool) {
     };
     DestroyWindow(editor.window);
     SetFocus(window);
-    for rect in [Some(editor.rect), Some(editor.text.bounds()), changed]
-        .into_iter()
-        .flatten()
+    for rect in [
+        Some(editor.frame().bounds()),
+        Some(editor.text.bounds()),
+        changed,
+    ]
+    .into_iter()
+    .flatten()
     {
         InvalidateRect(window, &rect, 0);
     }
@@ -1582,7 +1657,7 @@ unsafe fn update_cursor(point: POINT) {
             .map(|drag| drag.handle)
             .or_else(|| {
                 if let Some(editor) = &selection.editor {
-                    editor.text.hit_chrome(point)
+                    editor.frame().hit_chrome(point)
                 } else {
                     selection.selected_text().and_then(|text| text.hit(point))
                 }
@@ -1593,7 +1668,7 @@ unsafe fn update_cursor(point: POINT) {
         if selection
             .editor
             .as_ref()
-            .is_some_and(|editor| contains(editor.rect, point))
+            .is_some_and(|editor| editor.frame().contains(point))
         {
             return system(IDC_IBEAM);
         }
@@ -2033,6 +2108,7 @@ mod text_interaction_tests {
                 bounds: canvas,
                 surface: surface(),
             };
+            FillRect(desktop.surface.dc, &canvas, GetStockObject(WHITE_BRUSH));
             let hint = HintPanel::new(desktop.surface.dc, canvas).unwrap();
             let window = CreateWindowExW(
                 0,
@@ -2094,6 +2170,65 @@ mod text_interaction_tests {
                 let editor = s.as_ref().unwrap().editor.as_ref().unwrap();
                 (editor.window, editor.text.size)
             });
+            let chrome = Surface::new(null_mut(), 180, 68).unwrap();
+            let chrome_bounds = RECT {
+                right: 180,
+                bottom: 68,
+                ..Default::default()
+            };
+            FillRect(chrome.dc, &chrome_bounds, GetStockObject(WHITE_BRUSH));
+            let saved = SaveDC(chrome.dc);
+            SendMessageW(
+                editor,
+                WM_PRINTCLIENT,
+                chrome.dc as WPARAM,
+                (PRF_CLIENT | PRF_ERASEBKGND) as LPARAM,
+            );
+            RestoreDC(chrome.dc, saved);
+            assert_eq!(GetPixel(chrome.dc, 20, 0), 0x00ff_ffff, "native top border");
+            assert_eq!(
+                GetPixel(chrome.dc, 0, 20),
+                0x00ff_ffff,
+                "native left border"
+            );
+            let (frame, input, options) = SESSION.with_borrow(|s| {
+                let selection = s.as_ref().unwrap();
+                let editor = selection.editor.as_ref().unwrap();
+                (
+                    editor.frame().into_owned(),
+                    editor_input_rect(editor.rect),
+                    selection.options.unwrap().bounds,
+                )
+            });
+            assert!(
+                options.top >= frame.bounds().bottom && options.top <= frame.bounds().bottom + 8
+            );
+            let composed = surface();
+            FillRect(composed.dc, &canvas, GetStockObject(WHITE_BRUSH));
+            frame.paint_frame(composed.dc);
+            let saved = SaveDC(composed.dc);
+            SetViewportOrgEx(composed.dc, input.left, input.top, null_mut());
+            SendMessageW(
+                editor,
+                WM_PRINTCLIENT,
+                composed.dc as WPARAM,
+                (PRF_CLIENT | PRF_ERASEBKGND) as LPARAM,
+            );
+            RestoreDC(composed.dc, saved);
+            for (edge, samples) in [
+                ("top", [(120, 109), (120, 110)]),
+                ("left", [(79, 145), (80, 145)]),
+                ("bottom", [(120, 177), (120, 178)]),
+                ("right", [(259, 145), (260, 145)]),
+            ] {
+                for (x, y) in samples {
+                    assert_eq!(
+                        GetPixel(composed.dc, x, y),
+                        BORDER_BLUE,
+                        "{edge} border at ({x}, {y})"
+                    );
+                }
+            }
             let mut corner = POINT { x: 80, y: 110 };
             ClientToScreen(window, &mut corner);
             SendMessageW(
@@ -2112,6 +2247,7 @@ mod text_interaction_tests {
                     .as_ref()
                     .expect("blank editor stays open while resizing");
                 assert!(editor.text.size > initial_size);
+                assert!(s.as_ref().unwrap().options.unwrap().bounds.left < options.left);
                 editor.window
             });
             SetWindowTextW(editor, w!("Snapshot"));
@@ -2124,6 +2260,36 @@ mod text_interaction_tests {
             mouse(WM_LBUTTONDBLCLK, 181, 160);
             assert!(SESSION.with_borrow(|s| s.as_ref().unwrap().editor.is_some()));
             assert_eq!(GetCursor(), LoadCursorW(null_mut(), IDC_IBEAM));
+            finish_text(window, false);
+            mouse(WM_LBUTTONDOWN, 30, 50);
+            mouse(WM_LBUTTONUP, 30, 50);
+            let frame_bounds =
+                || SESSION.with_borrow(|s| s.as_ref().unwrap().text_frame().unwrap().bounds());
+            let before_rotation = frame_bounds();
+            mouse(WM_LBUTTONDOWN, 120, 36);
+            assert!(SESSION.with_borrow(|s| s.as_ref().unwrap().options.is_none()));
+            mouse(WM_MOUSEMOVE, 170, 55);
+            let preview = frame_bounds();
+            let hidden = SESSION.with_borrow(|s| s.as_ref().unwrap().options.is_none());
+            mouse(WM_LBUTTONUP, 170, 55);
+            assert_eq!(EqualRect(&before_rotation, &preview), 0);
+            assert_ne!(
+                EqualRect(&preview, &frame_bounds()),
+                0,
+                "empty frame keeps the rotation preview on release"
+            );
+            assert!(hidden, "hide the text settings while rotating");
+            assert!(SESSION.with_borrow(|s| s.as_ref().unwrap().options.is_some()));
+            let editor =
+                SESSION.with_borrow(|s| s.as_ref().unwrap().editor.as_ref().unwrap().window);
+            SetWindowTextW(editor, w!("Rotated"));
+            SendMessageW(window, FINISH_TEXT, 1, editor as LPARAM);
+            assert!(SESSION.with_borrow(|s| s
+                .as_ref()
+                .unwrap()
+                .selected_text()
+                .unwrap()
+                .is_rotated()));
             DestroyWindow(window);
         }
     }

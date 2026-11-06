@@ -8,7 +8,7 @@ use windows_sys::{
 
 use crate::{
     annotation::{Style, Tool, INK},
-    selection_geometry::contains,
+    selection_geometry::{contains, intersect},
     toolbar::paint_panel,
     typography::{self, TextStyle},
     wide,
@@ -100,6 +100,37 @@ impl Options {
             tool,
             swatch,
         })
+    }
+
+    pub fn near_text(mut self, frame: RECT, toolbar: RECT, area: RECT) -> Option<Self> {
+        let width = self.bounds.right - self.bounds.left;
+        if area.right - area.left < width || area.bottom - area.top < HEIGHT {
+            return None;
+        }
+        let left = frame.left.clamp(area.left, area.right - width);
+        let top = frame.top.clamp(area.top, area.bottom - HEIGHT);
+        let candidates = [
+            (left, frame.bottom + GAP),
+            (left, frame.top - GAP - HEIGHT),
+            (frame.right + GAP, top),
+            (frame.left - GAP - width, top),
+        ];
+        self.bounds = candidates
+            .into_iter()
+            .map(|(left, top)| RECT {
+                left,
+                top,
+                right: left + width,
+                bottom: top + HEIGHT,
+            })
+            .find(|bounds| {
+                bounds.left >= area.left
+                    && bounds.top >= area.top
+                    && bounds.right <= area.right
+                    && bounds.bottom <= area.bottom
+                    && intersect(*bounds, toolbar).is_none()
+            })?;
+        Some(self)
     }
 
     fn cell(self, left: i32, width: i32) -> RECT {

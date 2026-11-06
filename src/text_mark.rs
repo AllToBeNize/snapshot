@@ -3,7 +3,10 @@ use windows_sys::Win32::{
     Graphics::Gdi::*,
 };
 
-use crate::{selection_geometry::BORDER_BLUE, typography};
+use crate::{
+    selection_geometry::{intersect, BORDER_BLUE},
+    typography,
+};
 
 #[derive(Clone, PartialEq)]
 pub struct TextMark {
@@ -24,7 +27,8 @@ pub enum TextHandle {
 }
 
 const CORNERS: [(i32, i32); 4] = [(-1, -1), (1, -1), (1, 1), (-1, 1)];
-const ROTATE_OFFSET: i32 = 19;
+const ROTATE_OFFSET: i32 = 14;
+const ROTATE_RADIUS: i32 = 9;
 const MIN_SIZE: i32 = 8;
 const MAX_SIZE: i32 = 128;
 
@@ -56,6 +60,28 @@ impl TextMark {
     }
 
     pub fn edit_rect(&self, clip: RECT) -> RECT {
+        if self.is_rotated() {
+            let (sin, cos) = self.angle.sin_cos();
+            let (sin, cos) = (sin.abs(), cos.abs());
+            let width = f64::from(self.width);
+            let height = f64::from(self.height);
+            // Keep the horizontal native input inside the rotated outline.
+            let projected_width = width * cos + height * sin;
+            let projected_height = width * sin + height * cos;
+            let scale = ((width - 4.0).max(1.0) / (projected_width * cos + projected_height * sin))
+                .min((height - 4.0).max(1.0) / (projected_width * sin + projected_height * cos));
+            let half_width = projected_width * scale / 2.0;
+            let half_height = projected_height * scale / 2.0;
+            let inside = RECT {
+                left: (self.center.0 - half_width).ceil() as i32,
+                top: (self.center.1 - half_height).ceil() as i32,
+                right: (self.center.0 + half_width).floor() as i32,
+                bottom: (self.center.1 + half_height).floor() as i32,
+            };
+            if let Some(visible) = intersect(inside, clip) {
+                return visible;
+            }
+        }
         let width = self.width.max(32).min(clip.right - clip.left);
         let height = self.height.max(self.size + 10).min(clip.bottom - clip.top);
         let left = (self.center.0.round() as i32 - width / 2).clamp(clip.left, clip.right - width);
@@ -66,6 +92,10 @@ impl TextMark {
             right: left + width,
             bottom: top + height,
         }
+    }
+
+    pub fn is_rotated(&self) -> bool {
+        self.angle.cos() < 1.0 - f64::EPSILON
     }
 
     fn transform(&self, x: f64, y: f64) -> (f64, f64) {
@@ -128,10 +158,10 @@ impl TextMark {
             bounds.bottom = bounds.bottom.max(point.y);
         }
         RECT {
-            left: bounds.left - 7,
-            top: bounds.top - 7,
-            right: bounds.right + 8,
-            bottom: bounds.bottom + 8,
+            left: bounds.left - ROTATE_RADIUS - 2,
+            top: bounds.top - ROTATE_RADIUS - 2,
+            right: bounds.right + ROTATE_RADIUS + 3,
+            bottom: bounds.bottom + ROTATE_RADIUS + 3,
         }
     }
 
@@ -143,7 +173,12 @@ impl TextMark {
     pub fn hit_chrome(&self, point: POINT) -> Option<TextHandle> {
         let near =
             |handle: POINT| (handle.x - point.x).abs() <= 6 && (handle.y - point.y).abs() <= 6;
-        if near(self.rotation_point()) {
+        let rotate = self.rotation_point();
+        let dx = rotate.x - point.x;
+        let dy = rotate.y - point.y;
+        if i64::from(dx) * i64::from(dx) + i64::from(dy) * i64::from(dy)
+            <= i64::from((ROTATE_RADIUS + 1).pow(2))
+        {
             return Some(TextHandle::Rotate);
         }
         for (x, y) in CORNERS {
@@ -165,6 +200,16 @@ impl TextMark {
     }
 
     pub fn transform_drag(&self, handle: TextHandle, anchor: POINT, point: POINT) -> Self {
+        self.transform_drag_from(self, handle, anchor, point)
+    }
+
+    pub fn transform_drag_from(
+        &self,
+        frame: &Self,
+        handle: TextHandle,
+        anchor: POINT,
+        point: POINT,
+    ) -> Self {
         let mut next = self.clone();
         if anchor.x == point.x && anchor.y == point.y {
             return next;
@@ -176,15 +221,16 @@ impl TextMark {
             }
             TextHandle::Rotate => {
                 let angle = |point: POINT| {
-                    (f64::from(point.y) - self.center.1).atan2(f64::from(point.x) - self.center.0)
+                    (f64::from(point.y) - frame.center.1).atan2(f64::from(point.x) - frame.center.0)
                 };
                 next.angle += angle(point) - angle(anchor);
             }
             TextHandle::Scale(x, y) => {
                 let fixed = self.corner(-x, -y);
-                let dragged = self.corner(x, y);
-                let dx = f64::from(dragged.x - fixed.x);
-                let dy = f64::from(dragged.y - fixed.y);
+                let origin = frame.corner(-x, -y);
+                let dragged = frame.corner(x, y);
+                let dx = f64::from(dragged.x - origin.x);
+                let dy = f64::from(dragged.y - origin.y);
                 let delta_x = f64::from(point.x - anchor.x);
                 let delta_y = f64::from(point.y - anchor.y);
                 let factor = 1.0 + (delta_x * dx + delta_y * dy) / (dx * dx + dy * dy).max(1.0);
@@ -264,8 +310,13 @@ impl TextMark {
         if saved == 0 {
             return;
         }
-        SelectObject(dc, GetStockObject(DC_PEN));
-        SetDCPenColor(dc, BORDER_BLUE);
+        let pen = CreatePen(PS_SOLID, 2, BORDER_BLUE);
+        if pen.is_null() {
+            SelectObject(dc, GetStockObject(DC_PEN));
+            SetDCPenColor(dc, BORDER_BLUE);
+        } else {
+            SelectObject(dc, pen);
+        }
         SelectObject(dc, GetStockObject(WHITE_BRUSH));
         let corners = CORNERS.map(|(x, y)| self.corner(x, y));
         let outline = [corners[0], corners[1], corners[2], corners[3], corners[0]];
@@ -273,10 +324,29 @@ impl TextMark {
         let rotation = self.rotation_point();
         let stem = [self.screen_point(0, self.local_rect().top), rotation];
         Polyline(dc, stem.as_ptr(), 2);
-        for point in corners.into_iter().chain([rotation]) {
+        for point in corners {
             Ellipse(dc, point.x - 4, point.y - 4, point.x + 5, point.y + 5);
         }
+        let POINT { x, y } = rotation;
+        Ellipse(
+            dc,
+            x - ROTATE_RADIUS,
+            y - ROTATE_RADIUS,
+            x + ROTATE_RADIUS + 1,
+            y + ROTATE_RADIUS + 1,
+        );
+        SetArcDirection(dc, AD_CLOCKWISE);
+        Arc(dc, x - 5, y - 5, x + 6, y + 6, x + 4, y + 3, x + 5, y - 3);
+        let arrow = [
+            POINT { x: x + 5, y: y - 6 },
+            POINT { x: x + 5, y: y - 2 },
+            POINT { x: x + 1, y: y - 2 },
+        ];
+        Polyline(dc, arrow.as_ptr(), arrow.len() as i32);
         RestoreDC(dc, saved);
+        if !pen.is_null() {
+            DeleteObject(pen);
+        }
     }
 }
 

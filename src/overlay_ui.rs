@@ -128,7 +128,7 @@ impl HintMode {
                         (Mouse(Icon::MouseLeft), w!("双击文本框编辑")),
                         (Mouse(Icon::Move), w!("拖动文本框移动")),
                         (Mouse(Icon::Resize), w!("拖动四角缩放")),
-                        (Mouse(Icon::Drag), w!("拖动上方圆点旋转")),
+                        (Mouse(Icon::Drag), w!("拖动旋转手柄")),
                         (Bound(Binding::Undo), w!("撤回上一步")),
                     ]
                 }
