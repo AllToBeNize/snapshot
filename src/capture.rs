@@ -97,6 +97,40 @@ impl RegionCapture {
 }
 
 impl Desktop {
+    pub fn average_bgr(&self, rect: RECT) -> [u8; 3] {
+        let source_width = self.bounds.right - self.bounds.left;
+        let source_height = self.bounds.bottom - self.bounds.top;
+        assert!(
+            rect.left >= 0
+                && rect.top >= 0
+                && rect.right <= source_width
+                && rect.bottom <= source_height
+                && rect.left < rect.right
+                && rect.top < rect.bottom
+        );
+        let stride = source_width as usize * BYTES_PER_PIXEL;
+        let width = (rect.right - rect.left) as usize;
+        let height = (rect.bottom - rect.top) as usize;
+        let mut sum = [0u64; 3];
+        for y in rect.top..rect.bottom {
+            let offset = y as usize * stride + rect.left as usize * BYTES_PER_PIXEL;
+            // The source is the frozen capture, and the mosaic tiles are clipped to it.
+            let row = unsafe {
+                slice::from_raw_parts(
+                    self.surface.pixels.as_ptr().add(offset),
+                    width * BYTES_PER_PIXEL,
+                )
+            };
+            for pixel in row.chunks_exact(BYTES_PER_PIXEL) {
+                for channel in 0..3 {
+                    sum[channel] += u64::from(pixel[channel]);
+                }
+            }
+        }
+        let count = (width * height) as u64;
+        sum.map(|channel| ((channel + count / 2) / count) as u8)
+    }
+
     pub fn visual_panel(
         &self,
         window: RECT,
@@ -219,6 +253,13 @@ impl Desktop {
 impl Surface {
     pub fn bitmap(&self) -> HBITMAP {
         self.bitmap
+    }
+
+    // The source buffer must fit the allocated DIB.
+    pub unsafe fn write_pixels(&self, source: &[u8]) {
+        self.pixels
+            .as_ptr()
+            .copy_from_nonoverlapping(source.as_ptr(), source.len());
     }
 
     pub unsafe fn new(reference: HDC, width: i32, height: i32) -> io::Result<Self> {

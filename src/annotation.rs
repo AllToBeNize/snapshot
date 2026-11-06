@@ -1,10 +1,10 @@
-use std::{collections::HashSet, ptr::null_mut};
+use std::ptr::null_mut;
 use windows_sys::Win32::{
     Foundation::{POINT, RECT},
     Graphics::Gdi::*,
 };
 
-use crate::{selection_geometry::intersect, text_mark::TextMark};
+use crate::{capture::Desktop, mosaic::Mosaic, text_mark::TextMark};
 
 pub const INK: u32 = 0x0038_46ff;
 
@@ -45,15 +45,14 @@ pub struct Draft {
     start: POINT,
     end: POINT,
     points: Vec<POINT>,
-    visited: HashSet<(i32, i32)>,
-    tiles: Vec<(RECT, u32)>,
+    mosaic: Mosaic,
 }
 
 pub enum Mark {
     Rectangle(RECT),
     Text(TextMark),
     Brush(Vec<POINT>, i32, u32),
-    Mosaic(Vec<(RECT, u32)>),
+    Mosaic(Mosaic),
 }
 
 enum Edit {
@@ -189,7 +188,7 @@ impl History {
                     draft.style.brush_width,
                     draft.style.brush_color,
                 ),
-                Tool::Mosaic => paint_tiles(dc, &draft.tiles),
+                Tool::Mosaic => draft.mosaic.paint(dc),
                 _ => outline(dc, draft.rect()),
             }
         }
@@ -198,23 +197,29 @@ impl History {
 }
 
 impl Draft {
-    pub unsafe fn new(tool: Tool, point: POINT, style: Style, clip: RECT, source: HDC) -> Self {
+    pub fn new(tool: Tool, point: POINT, style: Style, clip: RECT, source: &Desktop) -> Self {
         let mut draft = Self {
             tool,
             style,
             start: point,
             end: point,
             points: vec![point],
-            visited: HashSet::new(),
-            tiles: Vec::new(),
+            mosaic: Mosaic::default(),
         };
         if tool == Tool::Mosaic {
-            draft.mosaic_segment(point, point, clip, source);
+            draft.mosaic.extend(
+                source,
+                clip,
+                point,
+                point,
+                style.mosaic_width,
+                style.mosaic_block,
+            );
         }
         draft
     }
 
-    pub unsafe fn update(&mut self, point: POINT, clip: RECT, source: HDC) -> RECT {
+    pub fn update(&mut self, point: POINT, clip: RECT, source: &Desktop) -> RECT {
         let point = POINT {
             x: point.x.clamp(clip.left, clip.right - 1),
             y: point.y.clamp(clip.top, clip.bottom - 1),
@@ -225,7 +230,14 @@ impl Draft {
             self.end = point;
             match self.tool {
                 Tool::Brush => self.points.push(point),
-                Tool::Mosaic => self.mosaic_segment(previous, point, clip, source),
+                Tool::Mosaic => self.mosaic.extend(
+                    source,
+                    clip,
+                    previous,
+                    point,
+                    self.style.mosaic_width,
+                    self.style.mosaic_block,
+                ),
                 _ => {}
             }
         }
@@ -242,65 +254,10 @@ impl Draft {
     fn stroke_bounds(&self, a: POINT, b: POINT) -> RECT {
         let pad = match self.tool {
             Tool::Brush => self.style.brush_width / 2 + 2,
-            Tool::Mosaic => self.style.mosaic_width / 2 + self.style.mosaic_block * 2,
+            Tool::Mosaic => self.style.mosaic_width / 2 + 2,
             _ => 3,
         };
         padded(between(a, b), pad)
-    }
-
-    unsafe fn mosaic_segment(&mut self, from: POINT, to: POINT, clip: RECT, source: HDC) {
-        let block = self.style.mosaic_block;
-        // A tile can touch the stroke even when its center lies outside the brush radius.
-        let reach = f64::from(self.style.mosaic_width) / 2.0
-            + f64::from(block) * std::f64::consts::FRAC_1_SQRT_2;
-        let pad = reach.ceil() as i32;
-        let dx = f64::from(to.x - from.x);
-        let dy = f64::from(to.y - from.y);
-        let length_squared = (dx * dx + dy * dy).max(1.0);
-        let first_y = (from.y.min(to.y) - pad).max(clip.top) / block * block;
-        let last_y = (from.y.max(to.y) + pad).min(clip.bottom - 1);
-        for y in (first_y..=last_y).step_by(block as usize) {
-            let (start, end) = if dy == 0.0 {
-                (0.0, 1.0)
-            } else {
-                let a = f64::from(y - pad - from.y) / dy;
-                let b = f64::from(y + block + pad - from.y) / dy;
-                (a.min(b).clamp(0.0, 1.0), a.max(b).clamp(0.0, 1.0))
-            };
-            let x1 = f64::from(from.x) + dx * start;
-            let x2 = f64::from(from.x) + dx * end;
-            let first_x = (x1.min(x2).floor() as i32 - pad).max(clip.left) / block * block;
-            let last_x = (x1.max(x2).ceil() as i32 + pad).min(clip.right - 1);
-            for x in (first_x..=last_x).step_by(block as usize) {
-                if self.visited.contains(&(x, y)) {
-                    continue;
-                }
-                let tile = intersect(
-                    clip,
-                    RECT {
-                        left: x,
-                        top: y,
-                        right: x + block,
-                        bottom: y + block,
-                    },
-                )
-                .unwrap();
-                let cx = (tile.left + tile.right) / 2;
-                let cy = (tile.top + tile.bottom) / 2;
-                let x_from = f64::from(cx - from.x);
-                let y_from = f64::from(cy - from.y);
-                let t = ((x_from * dx + y_from * dy) / length_squared).clamp(0.0, 1.0);
-                let gap_x = x_from - t * dx;
-                let gap_y = y_from - t * dy;
-                if gap_x * gap_x + gap_y * gap_y <= reach * reach {
-                    self.visited.insert((x, y));
-                    let color = GetPixel(source, cx, cy);
-                    if color != CLR_INVALID {
-                        self.tiles.push((tile, color));
-                    }
-                }
-            }
-        }
     }
 
     fn rect(&self) -> RECT {
@@ -331,7 +288,7 @@ impl Draft {
                 self.style.brush_width,
                 self.style.brush_color,
             )),
-            Tool::Mosaic => (!self.tiles.is_empty()).then_some(Mark::Mosaic(self.tiles)),
+            Tool::Mosaic => self.mosaic.finish().map(Mark::Mosaic),
             Tool::Text => None,
         }
     }
@@ -342,7 +299,7 @@ impl Mark {
         match self {
             Self::Rectangle(rect) => outline(dc, *rect),
             Self::Brush(points, width, color) => stroke(dc, points, *width, *color),
-            Self::Mosaic(tiles) => paint_tiles(dc, tiles),
+            Self::Mosaic(mosaic) => mosaic.paint(dc),
             Self::Text(text) => text.paint(dc),
         }
     }
@@ -372,20 +329,6 @@ fn padded(rect: RECT, n: i32) -> RECT {
         top: rect.top - n,
         right: rect.right + n,
         bottom: rect.bottom + n,
-    }
-}
-
-unsafe fn paint_tiles(dc: HDC, tiles: &[(RECT, u32)]) {
-    let mut dirty = RECT::default();
-    if GetClipBox(dc, &mut dirty) <= NULLREGION {
-        return;
-    }
-    let brush = GetStockObject(DC_BRUSH);
-    for (rect, color) in tiles {
-        if intersect(*rect, dirty).is_some() {
-            SetDCBrushColor(dc, *color);
-            FillRect(dc, rect, brush);
-        }
     }
 }
 
@@ -507,22 +450,49 @@ mod tests {
                 ..Default::default()
             };
             FillRect(source.dc, &clip, GetStockObject(WHITE_BRUSH));
+            let half_block = RECT {
+                left: 12,
+                top: 36,
+                right: 18,
+                bottom: 48,
+            };
+            FillRect(source.dc, &half_block, GetStockObject(BLACK_BRUSH));
+            GdiFlush();
+            let source = Desktop {
+                bounds: clip,
+                surface: source,
+            };
             FillRect(target.dc, &clip, GetStockObject(BLACK_BRUSH));
             let mut draft = Draft::new(
                 Tool::Mosaic,
                 POINT { x: 15, y: 40 },
                 Style::default(),
                 clip,
-                source.dc,
+                &source,
             );
-            draft.update(POINT { x: 105, y: 40 }, clip, source.dc);
+            draft.update(POINT { x: 105, y: 40 }, clip, &source);
             let mut history = History::default();
             history.push(draft.finish().unwrap());
             history.paint(target.dc, clip, false, None);
-            for x in 15..=105 {
+            assert_eq!(GetPixel(target.dc, 15, 40), 0x0080_8080);
+            assert_eq!(GetPixel(target.dc, 20, 40), 0x0080_8080);
+            for x in 24..=105 {
                 assert_eq!(GetPixel(target.dc, x, 40), 0x00ff_ffff);
                 assert_eq!(GetPixel(target.dc, x, 72), 0);
             }
+            assert_eq!(GetPixel(target.dc, 50, 24), 0x0080_8080);
+            assert_eq!(GetPixel(target.dc, 50, 22), 0);
+            let export = RECT {
+                left: 20,
+                top: 20,
+                right: 110,
+                bottom: 70,
+            };
+            let image = source
+                .composite_crop(export, |dc| history.paint(dc, export, false, None))
+                .unwrap();
+            let offset = 20 * image.width as usize * 4;
+            assert_eq!(image.pixels[offset..offset + 3], [128; 3]);
             history.undo();
             assert!(!history.has_marks());
         }

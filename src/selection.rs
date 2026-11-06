@@ -77,7 +77,7 @@ struct Selection {
 }
 
 struct TextDrag {
-    index: usize,
+    index: Option<usize>,
     anchor: POINT,
     handle: TextHandle,
     original: TextMark,
@@ -103,6 +103,13 @@ impl Selection {
     fn selected_text(&self) -> Option<&TextMark> {
         self.selected_text
             .and_then(|index| self.annotations.text(index))
+    }
+
+    fn text_frame(&self) -> Option<&TextMark> {
+        self.editor
+            .as_ref()
+            .map(|editor| &editor.text)
+            .or_else(|| self.selected_text())
     }
 
     fn option_style(&self) -> Style {
@@ -286,7 +293,6 @@ unsafe extern "system" fn window_proc(
                 }
                 return 0;
             }
-            finish_text(window, true);
             let toolbar = SESSION.with_borrow(|session| session.as_ref()?.toolbar);
             if let Some(toolbar) = toolbar.filter(|toolbar| contains(toolbar.bounds, point)) {
                 if let Some(action) = toolbar.hit(point) {
@@ -294,6 +300,10 @@ unsafe extern "system" fn window_proc(
                 }
                 return 0;
             }
+            if begin_editor_drag(window, point) {
+                return 0;
+            }
+            finish_text(window, true);
             if begin_text_drag(window, point, message == WM_LBUTTONDBLCLK) {
                 hide_loupe(window);
                 return 0;
@@ -768,7 +778,7 @@ unsafe fn begin_annotation(window: HWND, point: POINT) -> bool {
             point,
             selection.style,
             selection.rect,
-            selection.desktop.surface.dc,
+            &selection.desktop,
         );
         let dirty = draft.start_bounds();
         selection.annotations.draft = Some(draft);
@@ -789,7 +799,7 @@ unsafe fn update_annotation(window: HWND, point: POINT, end: bool) -> bool {
     let change = SESSION.with_borrow_mut(|session| {
         let selection = session.as_mut()?;
         let draft = selection.annotations.draft.as_mut()?;
-        let dirty = draft.update(point, selection.rect, selection.desktop.surface.dc);
+        let dirty = draft.update(point, selection.rect, &selection.desktop);
         let finished = end.then(|| selection.annotations.draft.take().unwrap());
         Some((dirty, selection.rect, selection.style, finished))
     });
@@ -840,7 +850,7 @@ unsafe fn begin_text_drag(window: HWND, point: POINT, double: bool) -> bool {
             Some((previous, bounds, Some((index, text))))
         } else {
             selection.text_drag = Some(TextDrag {
-                index,
+                index: Some(index),
                 anchor: point,
                 handle,
                 original: text,
@@ -866,12 +876,53 @@ unsafe fn begin_text_drag(window: HWND, point: POINT, double: bool) -> bool {
     true
 }
 
+unsafe fn begin_editor_drag(window: HWND, point: POINT) -> bool {
+    let target = SESSION.with_borrow(|session| {
+        let editor = session.as_ref()?.editor.as_ref()?;
+        Some((editor.window, editor.text.hit_chrome(point)?))
+    });
+    let Some((editor, handle)) = target else {
+        return false;
+    };
+    let value = read_editor_text(editor);
+    let bounds = SESSION.with_borrow_mut(|session| {
+        let selection = session.as_mut().unwrap();
+        let editor = selection.editor.as_mut().unwrap();
+        editor.text.text = value;
+        if !editor.text.text.is_empty() {
+            editor.text.fit_text(selection.desktop.surface.dc);
+            let index = if let Some(index) = editor.index {
+                selection
+                    .annotations
+                    .replace_text(index, editor.text.clone());
+                index
+            } else {
+                selection.annotations.push(Mark::Text(editor.text.clone()))
+            };
+            editor.index = Some(index);
+            selection.selected_text = Some(index);
+        }
+        selection.text_drag = Some(TextDrag {
+            index: None,
+            anchor: point,
+            handle,
+            original: editor.text.clone(),
+        });
+        editor.rect
+    });
+    SetCapture(window);
+    ShowWindow(editor, SW_HIDE);
+    SetFocus(window);
+    InvalidateRect(window, &bounds, 0);
+    SetCursor(LoadCursorW(null_mut(), text_handle_cursor(handle)));
+    true
+}
+
 unsafe fn update_text_drag(window: HWND, point: POINT, end: bool) -> bool {
     let changed = SESSION.with_borrow_mut(|session| {
         let selection = session.as_mut()?;
         let drag = selection.text_drag.as_ref()?;
-        let text = selection.annotations.text_mut(drag.index)?;
-        let previous = text.bounds();
+        let previous = selection.text_frame()?.bounds();
         let limit = if matches!(drag.handle, TextHandle::Move) {
             selection.rect
         } else {
@@ -888,23 +939,38 @@ unsafe fn update_text_drag(window: HWND, point: POINT, end: bool) -> bool {
             next.fit_text(selection.desktop.surface.dc);
         }
         let current = next.bounds();
+        let editing = drag.index.is_none();
         if end {
             let drag = selection.text_drag.take().unwrap();
-            *text = drag.original;
-            selection.annotations.replace_text(drag.index, next);
+            if let Some(index) = drag.index {
+                *selection.annotations.text_mut(index)? = drag.original;
+                selection.annotations.replace_text(index, next);
+            } else {
+                let editor = selection.editor.as_mut()?;
+                if let Some(index) = editor.index.filter(|_| !next.text.is_empty()) {
+                    selection.annotations.replace_text(index, next.clone());
+                }
+                editor.text = next;
+            }
+        } else if let Some(index) = drag.index {
+            *selection.annotations.text_mut(index)? = next;
         } else {
-            *text = next;
+            selection.editor.as_mut()?.text = next;
         }
-        Some([previous, current])
+        Some(([previous, current], editing))
     });
-    if let Some(dirty) = changed {
+    if let Some((dirty, editing)) = changed {
         for rect in dirty {
             InvalidateRect(window, &rect, 0);
         }
         if end {
             ReleaseCapture();
             invalidate_toolbar(window);
-            update_cursor(point);
+            if editing {
+                resume_editor(window);
+            } else {
+                update_cursor(point);
+            }
         }
         if let Some(options) = SESSION.with_borrow(|session| session.as_ref()?.options) {
             InvalidateRect(window, &options.bounds, 0);
@@ -917,17 +983,24 @@ unsafe fn cancel_text_drag(window: HWND) {
     let changed = SESSION.with_borrow_mut(|session| {
         let selection = session.as_mut()?;
         let drag = selection.text_drag.take()?;
-        let text = selection.annotations.text_mut(drag.index)?;
+        let text = if let Some(index) = drag.index {
+            selection.annotations.text_mut(index)?
+        } else {
+            &mut selection.editor.as_mut()?.text
+        };
         let previous = text.bounds();
         *text = drag.original;
-        Some([previous, text.bounds()])
+        Some(([previous, text.bounds()], drag.index.is_none()))
     });
-    if let Some(dirty) = changed {
+    if let Some((dirty, editing)) = changed {
         for rect in dirty {
             InvalidateRect(window, &rect, 0);
         }
         refresh_options(window);
         invalidate_toolbar(window);
+        if editing {
+            resume_editor(window);
+        }
     }
 }
 
@@ -1012,9 +1085,50 @@ unsafe fn open_text(window: HWND, index: Option<usize>, text: TextMark) {
     set_editor_format(editor, rect);
     ShowWindow(editor, SW_SHOW);
     SetFocus(editor);
+    SetCursor(LoadCursorW(null_mut(), IDC_IBEAM));
     InvalidateRect(window, &bounds, 0);
     refresh_options(window);
     refresh_hint(window);
+}
+
+unsafe fn resume_editor(window: HWND) {
+    let layout = SESSION.with_borrow_mut(|session| {
+        let selection = session.as_mut()?;
+        let editor = selection.editor.as_ref()?;
+        let rect = text_editor_bounds(selection, &editor.text);
+        let background = text_editor_background(selection, rect, editor.index).ok();
+        let editor = selection.editor.as_mut().unwrap();
+        let previous = editor.rect;
+        if let Some(background) = background {
+            DeleteObject(std::mem::replace(&mut editor.background, background));
+            editor.rect = rect;
+        }
+        Some((editor.window, editor.rect, previous, editor.text.size))
+    });
+    let Some((editor, rect, previous, size)) = layout else {
+        return;
+    };
+    SendMessageW(
+        editor,
+        WM_SETFONT,
+        typography::annotation_font(size) as usize,
+        0,
+    );
+    SetWindowPos(
+        editor,
+        null_mut(),
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    set_editor_format(editor, rect);
+    ShowWindow(editor, SW_SHOW);
+    SetFocus(editor);
+    InvalidateRect(editor, null(), 1);
+    InvalidateRect(window, &previous, 0);
+    update_cursor_at_pointer(window);
 }
 
 unsafe fn set_editor_format(editor: HWND, rect: RECT) {
@@ -1092,30 +1206,68 @@ unsafe extern "system" fn text_proc(
     _: usize,
     parent: usize,
 ) -> LRESULT {
+    let parent = parent as HWND;
+    if message == WM_SETCURSOR {
+        let mut point = POINT::default();
+        let handle = if GetCursorPos(&mut point) != 0 && ScreenToClient(parent, &mut point) != 0 {
+            SESSION.with_borrow(|session| session.as_ref()?.editor.as_ref()?.text.hit_chrome(point))
+        } else {
+            None
+        };
+        SetCursor(LoadCursorW(
+            null_mut(),
+            handle.map_or(IDC_IBEAM, text_handle_cursor),
+        ));
+        return 1;
+    }
+    if matches!(
+        message,
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK
+    ) {
+        let mut point = mouse_point(lparam);
+        if matches!(message, WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK) {
+            ScreenToClient(parent, &mut point);
+        } else {
+            MapWindowPoints(editor, parent, &mut point, 1);
+        }
+        if begin_editor_drag(parent, point) {
+            return 0;
+        }
+    }
     if message == WM_KEYDOWN {
         let escape = key == VK_ESCAPE as usize;
         let control = GetKeyState(VK_CONTROL as i32) < 0;
         if escape || (key == VK_RETURN as usize && control) {
-            PostMessageW(
-                parent as HWND,
-                FINISH_TEXT,
-                usize::from(!escape),
-                editor as LPARAM,
-            );
+            PostMessageW(parent, FINISH_TEXT, usize::from(!escape), editor as LPARAM);
             return 0;
         }
     }
     DefSubclassProc(editor, message, key, lparam)
 }
 
+unsafe fn read_editor_text(editor: HWND) -> Vec<u16> {
+    let length = GetWindowTextLengthW(editor);
+    let mut value = vec![0; length as usize + 1];
+    let read = GetWindowTextW(editor, value.as_mut_ptr(), value.len() as i32);
+    value.truncate(read as usize);
+    value
+}
+
 unsafe fn finish_text(window: HWND, save: bool) {
+    let dragging_editor = SESSION.with_borrow(|session| {
+        session
+            .as_ref()
+            .and_then(|selection| selection.text_drag.as_ref())
+            .is_some_and(|drag| drag.index.is_none())
+    });
+    if dragging_editor {
+        cancel_text_drag(window);
+        ReleaseCapture();
+    }
     let editor = SESSION.with_borrow_mut(|session| session.as_mut()?.editor.take());
     let Some(editor) = editor else { return };
     let changed = if save {
-        let length = GetWindowTextLengthW(editor.window);
-        let mut value = vec![0; length as usize + 1];
-        let read = GetWindowTextW(editor.window, value.as_mut_ptr(), value.len() as i32);
-        value.truncate(read as usize);
+        let value = read_editor_text(editor.window);
         SESSION.with_borrow_mut(|session| {
             let selection = session.as_mut().unwrap();
             if value.is_empty() {
@@ -1428,14 +1580,22 @@ unsafe fn update_cursor(point: POINT) {
             .text_drag
             .as_ref()
             .map(|drag| drag.handle)
-            .or_else(|| selection.selected_text().and_then(|text| text.hit(point)));
-        if let Some(handle) = text_handle {
-            return system(match handle {
-                TextHandle::Move => IDC_SIZEALL,
-                TextHandle::Scale(x, y) if x == y => IDC_SIZENWSE,
-                TextHandle::Scale(..) => IDC_SIZENESW,
-                TextHandle::Rotate => IDC_HAND,
+            .or_else(|| {
+                if let Some(editor) = &selection.editor {
+                    editor.text.hit_chrome(point)
+                } else {
+                    selection.selected_text().and_then(|text| text.hit(point))
+                }
             });
+        if let Some(handle) = text_handle {
+            return system(text_handle_cursor(handle));
+        }
+        if selection
+            .editor
+            .as_ref()
+            .is_some_and(|editor| contains(editor.rect, point))
+        {
+            return system(IDC_IBEAM);
         }
         if contains(selection.rect, point) && !selection.automatic && selection.drag.is_none() {
             match selection.annotations.tool {
@@ -1497,6 +1657,15 @@ unsafe fn update_cursor(point: POINT) {
         })
     });
     SetCursor(cursor);
+}
+
+fn text_handle_cursor(handle: TextHandle) -> *const u16 {
+    match handle {
+        TextHandle::Move => IDC_SIZEALL,
+        TextHandle::Scale(x, y) if x == y => IDC_SIZENWSE,
+        TextHandle::Scale(..) => IDC_SIZENESW,
+        TextHandle::Rotate => IDC_HAND,
+    }
 }
 
 unsafe fn update_cursor_at_pointer(window: HWND) {
@@ -1654,6 +1823,18 @@ unsafe fn paint(window: HWND) {
                 true,
                 selection.editor.as_ref().and_then(|editor| editor.index),
             );
+            if let Some(editor) = selection
+                .editor
+                .as_ref()
+                .filter(|_| selection.text_drag.is_some())
+            {
+                let saved = SaveDC(dc);
+                if saved != 0 {
+                    IntersectClipRect(dc, rect.left, rect.top, rect.right, rect.bottom);
+                    editor.text.paint(dc);
+                    RestoreDC(dc, saved);
+                }
+            }
         }
         if !outline_empty(rect) {
             let blue = GetStockObject(DC_BRUSH);
@@ -1671,10 +1852,7 @@ unsafe fn paint(window: HWND) {
             SelectObject(dc, old_brush);
             SelectObject(dc, old_pen);
         }
-        if let Some(text) = selection
-            .selected_text()
-            .filter(|_| selection.editor.is_none())
-        {
+        if let Some(text) = selection.text_frame() {
             if intersect(text.bounds(), area).is_some() {
                 text.paint_frame(dc);
             }
@@ -1833,5 +2011,120 @@ unsafe fn output(window: HWND, action: Action) {
         }
         Ok(false) => {}
         Err(error) => show_error(window, &format!("输出截图失败。\n{error}")),
+    }
+}
+
+#[cfg(test)]
+mod text_interaction_tests {
+    use super::*;
+
+    #[test]
+    fn new_text_can_be_resized_before_typing_and_reopened_after_moving() {
+        unsafe {
+            let instance = GetModuleHandleW(null());
+            register(instance).unwrap();
+            let canvas = RECT {
+                right: 480,
+                bottom: 320,
+                ..Default::default()
+            };
+            let surface = || Surface::new(null_mut(), 480, 320).unwrap();
+            let desktop = Desktop {
+                bounds: canvas,
+                surface: surface(),
+            };
+            let hint = HintPanel::new(desktop.surface.dc, canvas).unwrap();
+            let window = CreateWindowExW(
+                0,
+                CLASS,
+                null(),
+                WS_POPUP | WS_CLIPCHILDREN,
+                0,
+                0,
+                480,
+                320,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            );
+            assert!(!window.is_null());
+            let mut annotations = History::default();
+            annotations.tool = Some(Tool::Text);
+            SESSION.replace(Some(Selection {
+                desktop,
+                dimmed: surface(),
+                back_buffer: surface(),
+                canvas,
+                targets: Vec::new(),
+                probe: None,
+                target: None,
+                pointer: None,
+                visual_probe: None,
+                automatic: false,
+                drag: None,
+                rect: RECT {
+                    left: 15,
+                    top: 30,
+                    right: 460,
+                    bottom: 260,
+                },
+                hint,
+                loupe: None,
+                pointer_monitor: canvas,
+                annotations,
+                toolbar: None,
+                toolbar_hover: None,
+                options: None,
+                options_hover: None,
+                style: Style::default(),
+                selected_text: None,
+                text_drag: None,
+                editor: None,
+                brush_cursor: None,
+                mosaic_cursor: None,
+            }));
+            refresh_toolbar(window);
+            let mouse = |message, x: i32, y: i32| {
+                SendMessageW(window, message, 0, ((y << 16) | x) as LPARAM);
+            };
+            mouse(WM_LBUTTONDOWN, 80, 110);
+            mouse(WM_LBUTTONUP, 80, 110);
+            let (editor, initial_size) = SESSION.with_borrow(|s| {
+                let editor = s.as_ref().unwrap().editor.as_ref().unwrap();
+                (editor.window, editor.text.size)
+            });
+            let mut corner = POINT { x: 80, y: 110 };
+            ClientToScreen(window, &mut corner);
+            SendMessageW(
+                editor,
+                WM_NCLBUTTONDOWN,
+                HTBORDER as usize,
+                ((corner.y << 16) | (corner.x & 0xffff)) as LPARAM,
+            );
+            mouse(WM_MOUSEMOVE, 56, 93);
+            mouse(WM_LBUTTONUP, 56, 93);
+            let editor = SESSION.with_borrow(|s| {
+                let editor = s
+                    .as_ref()
+                    .unwrap()
+                    .editor
+                    .as_ref()
+                    .expect("blank editor stays open while resizing");
+                assert!(editor.text.size > initial_size);
+                editor.window
+            });
+            SetWindowTextW(editor, w!("Snapshot"));
+            SendMessageW(window, FINISH_TEXT, 1, editor as LPARAM);
+            mouse(WM_LBUTTONDOWN, 148, 143);
+            mouse(WM_MOUSEMOVE, 181, 160);
+            mouse(WM_LBUTTONUP, 181, 160);
+            mouse(WM_LBUTTONDOWN, 181, 160);
+            mouse(WM_LBUTTONUP, 181, 160);
+            mouse(WM_LBUTTONDBLCLK, 181, 160);
+            assert!(SESSION.with_borrow(|s| s.as_ref().unwrap().editor.is_some()));
+            assert_eq!(GetCursor(), LoadCursorW(null_mut(), IDC_IBEAM));
+            DestroyWindow(window);
+        }
     }
 }

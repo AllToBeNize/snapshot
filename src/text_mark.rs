@@ -136,6 +136,11 @@ impl TextMark {
     }
 
     pub fn hit(&self, point: POINT) -> Option<TextHandle> {
+        self.hit_chrome(point)
+            .or_else(|| self.contains(point).then_some(TextHandle::Move))
+    }
+
+    pub fn hit_chrome(&self, point: POINT) -> Option<TextHandle> {
         let near =
             |handle: POINT| (handle.x - point.x).abs() <= 6 && (handle.y - point.y).abs() <= 6;
         if near(self.rotation_point()) {
@@ -146,7 +151,17 @@ impl TextMark {
                 return Some(TextHandle::Scale(x, y));
             }
         }
-        self.contains(point).then_some(TextHandle::Move)
+        let (x, y) = self.local_point(point);
+        let rect = self.local_rect();
+        let distance = [
+            x - f64::from(rect.left),
+            f64::from(rect.right) - x,
+            y - f64::from(rect.top),
+            f64::from(rect.bottom) - y,
+        ]
+        .into_iter()
+        .fold(f64::INFINITY, f64::min);
+        (-5.0..=3.0).contains(&distance).then_some(TextHandle::Move)
     }
 
     pub fn transform_drag(&self, handle: TextHandle, anchor: POINT, point: POINT) -> Self {
@@ -190,6 +205,9 @@ impl TextMark {
     }
 
     pub unsafe fn fit_text(&mut self, dc: HDC) {
+        if self.text.is_empty() {
+            return;
+        }
         self.width = self.width.max(self.size + 6);
         let previous = SelectObject(dc, typography::annotation_font(self.size));
         let mut bounds = RECT {
@@ -208,6 +226,9 @@ impl TextMark {
     }
 
     pub unsafe fn paint(&self, dc: HDC) {
+        if self.text.is_empty() {
+            return;
+        }
         let saved = SaveDC(dc);
         if saved == 0 {
             return;

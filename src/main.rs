@@ -5,6 +5,7 @@ mod annotation_options;
 mod capture;
 mod hotkey;
 mod icons;
+mod mosaic;
 mod overlay_ui;
 mod panel_edges;
 mod pinned;
